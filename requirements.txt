@@ -1,0 +1,13 @@
+pandas
+numpy
+scikit-learn
+xgboost
+lightgbm
+catboost
+optuna
+pyarrow
+cupy-cuda12x
+cuml-cu12
+torch
+torchvision
+torchaudio

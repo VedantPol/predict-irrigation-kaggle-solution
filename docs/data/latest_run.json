@@ -1,0 +1,22 @@
+{
+  "meta": {
+    "generated_at_utc": null,
+    "feature_set_name": "irrigation_digit_decimal_v1",
+    "result_folder": "outputs/level2_results/tree_level2_dataset_irrigation_digit_decimal_v1"
+  },
+  "headline": {
+    "models_trained": 0,
+    "level3_valid_auc": null,
+    "level4_valid_auc": null,
+    "stacking_valid_auc": null,
+    "hill_climb_valid_auc": null,
+    "stacking_models": 0,
+    "pseudo_rows": 0,
+    "pseudo_ratio": null,
+    "extra_train_rows": 0,
+    "pseudo_rows_added": 0
+  },
+  "timeline": [],
+  "library_summary": [],
+  "top_models": []
+}

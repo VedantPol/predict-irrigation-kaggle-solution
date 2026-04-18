@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+
+# Generated artifacts
+outputs/oof/*.npy
+outputs/pred/*.npy
+outputs/level2_results/
+outputs/submissions/
+data/processed/

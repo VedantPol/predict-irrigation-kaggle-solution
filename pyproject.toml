@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "predict-irrigation-kaggle-solution"
+version = "0.1.0"
+description = "Four-level irrigation-need prediction architecture for Kaggle Playground S6E4"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Project Team" }]
+
+[tool.setuptools.packages.find]
+where = ["src"]

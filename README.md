@@ -41,6 +41,7 @@ python scripts/run_pipeline.py
 ```
 
 The default run order executes all stages through `extra_training`.
+The runner now supports cached-resume for heavy stages (`prepare_data`, `feature_engineering`, `baseline`) via `scripts/run_pipeline.py`, so unchanged runs skip recomputation automatically.
 
 ## Main Outputs
 
@@ -55,7 +56,7 @@ The default run order executes all stages through `extra_training`.
 Edit only `scripts/run_pipeline.py`:
 
 - `PIPELINE_STAGE`
+- `RESUME_FROM_ARTIFACTS` / `FORCE_RERUN_STAGES`
 - `PREPARE_DATA_CONFIG`
 - `FEATURE_ENGINEERING_CONFIG`
 - `BASELINE_CONFIG`
-

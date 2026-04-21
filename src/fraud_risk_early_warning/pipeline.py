@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import copy
+import inspect
+import itertools
 import json
 import shutil
+from datetime import datetime
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -11,7 +14,7 @@ import numpy as np
 import pandas as pd
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import balanced_accuracy_score, roc_auc_score
+from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import StratifiedKFold, train_test_split
 
 from .advanced_features import (
@@ -37,6 +40,13 @@ try:
     from catboost import CatBoostClassifier
 except ImportError:  # pragma: no cover - optional runtime dependency
     CatBoostClassifier = None
+
+try:
+    import optuna
+    from optuna.samplers import TPESampler
+except Exception:  # pragma: no cover - optional runtime dependency
+    optuna = None
+    TPESampler = None
 
 try:
     import cupy as cp
@@ -165,6 +175,11 @@ class BaselineConfig:
     models_per_family: int = 5
     run_tree_level_stack: bool = True
     models_per_library: int = 5
+    use_tree_optuna: bool = False
+    tree_optuna_trials_per_library: int = 0
+    tree_optuna_max_tuned_models_per_library: int = 2
+    tree_optuna_train_max_rows: int = 180_000
+    tree_optuna_timeout_sec: int = 0
     tree_libraries: tuple[str, ...] = ("xgboost", "catboost", "lightgbm", "cuml_rf", "cuml_et")
     strict_gpu_only: bool = True
     min_tree_valid_auc_keep: float = 0.0
@@ -225,6 +240,29 @@ class BaselineConfig:
     level3_xgb_max_depth: int = 5
     level3_xgb_subsample: float = 0.85
     level3_xgb_colsample_bytree: float = 0.85
+    level3_cv_enabled: bool = True
+    level3_cv_folds: int = 5
+    level2_keep_top_models_for_meta: int = 36
+    level2_keep_min_models_for_meta: int = 16
+    level2_keep_model_auc_gap: float = 0.0025
+    use_balanced_sample_weight: bool = True
+    min_sample_weight_ratio: float = 0.25
+    max_sample_weight_ratio: float = 12.0
+    enable_class_weight_calibration: bool = True
+    class_weight_calibration_grid: tuple[float, ...] = (
+        0.60,
+        0.70,
+        0.80,
+        0.90,
+        1.00,
+        1.10,
+        1.20,
+        1.40,
+        1.60,
+        1.80,
+        2.00,
+    )
+    class_weight_calibration_random_trials: int = 120
     family_prefixes: dict[str, tuple[str, ...]] = field(
         default_factory=lambda: {k: tuple(v) for k, v in DEFAULT_FAMILY_PREFIXES.items()}
     )
@@ -312,7 +350,200 @@ def _score_predictions(y_true: np.ndarray, pred: np.ndarray) -> float:
         return float(roc_auc_score(y_true_i, pred_arr.reshape(-1)))
     proba = _ensure_proba_2d(pred_arr, n_classes=n_classes)
     y_hat = np.argmax(proba, axis=1).astype(np.int32)
-    return float(balanced_accuracy_score(y_true_i, y_hat))
+    class_counts = np.bincount(y_true_i, minlength=n_classes).astype(np.float64)
+    correct = np.bincount(y_true_i[y_hat == y_true_i], minlength=n_classes).astype(np.float64)
+    valid = class_counts > 0
+    if not np.any(valid):
+        return 0.0
+    recall = np.zeros(n_classes, dtype=np.float64)
+    recall[valid] = correct[valid] / np.clip(class_counts[valid], 1.0, None)
+    return float(np.mean(recall[valid]))
+
+
+def _compute_balanced_sample_weight(
+    y: np.ndarray,
+    *,
+    min_ratio: float,
+    max_ratio: float,
+) -> tuple[np.ndarray, dict[int, float]]:
+    y_arr = np.asarray(y).astype(np.int32).reshape(-1)
+    if y_arr.size == 0:
+        return np.zeros(0, dtype=np.float32), {}
+
+    counts = np.bincount(y_arr)
+    present = np.where(counts > 0)[0]
+    if present.size <= 1:
+        return np.ones(y_arr.shape[0], dtype=np.float32), {int(present[0]) if present.size else 0: 1.0}
+
+    avg_count = float(y_arr.shape[0]) / float(present.size)
+    floor_ratio = float(max(1e-4, min_ratio))
+    ceil_ratio = float(max(floor_ratio, max_ratio))
+    class_weight_map: dict[int, float] = {}
+    for cls in present:
+        ratio = avg_count / float(max(1, counts[cls]))
+        ratio = min(ceil_ratio, max(floor_ratio, ratio))
+        class_weight_map[int(cls)] = float(ratio)
+
+    sample_weight = np.array([class_weight_map.get(int(v), 1.0) for v in y_arr], dtype=np.float32)
+    return sample_weight, class_weight_map
+
+
+def _apply_class_probability_weights(pred: np.ndarray, class_weights: np.ndarray) -> np.ndarray:
+    proba = _ensure_proba_2d(np.asarray(pred), n_classes=int(len(class_weights))).astype(np.float32)
+    weights = np.asarray(class_weights, dtype=np.float32).reshape(1, -1)
+    weighted = proba * weights
+    row_sum = np.clip(weighted.sum(axis=1, keepdims=True), 1e-9, None)
+    return (weighted / row_sum).astype(np.float32)
+
+
+def _optimize_class_probability_weights(
+    *,
+    y_true: np.ndarray,
+    pred: np.ndarray,
+    grid_values: tuple[float, ...],
+    random_trials: int,
+    random_state: int,
+) -> tuple[np.ndarray, np.ndarray, float, int]:
+    y_arr = np.asarray(y_true).astype(np.int32).reshape(-1)
+    n_classes = int(np.max(y_arr)) + 1 if y_arr.size else 0
+    if n_classes <= 1:
+        proba = _ensure_proba_2d(np.asarray(pred), n_classes=max(1, n_classes)).astype(np.float32)
+        return proba, np.ones(max(1, n_classes), dtype=np.float32), _score_predictions(y_arr, proba), 0
+
+    base_proba = _ensure_proba_2d(np.asarray(pred), n_classes=n_classes).astype(np.float32)
+    best_pred = base_proba
+    best_weights = np.ones(n_classes, dtype=np.float32)
+    best_score = float(_score_predictions(y_arr, best_pred))
+    evaluated = 0
+
+    grid = tuple(sorted(set(float(v) for v in grid_values if float(v) > 0.0)))
+    if not grid:
+        grid = (1.0,)
+
+    if n_classes <= 4 and len(grid) <= 11:
+        for weights in itertools.product(grid, repeat=n_classes):
+            w = np.asarray(weights, dtype=np.float32)
+            calibrated = _apply_class_probability_weights(base_proba, w)
+            score = float(_score_predictions(y_arr, calibrated))
+            evaluated += 1
+            if score > best_score + 1e-10:
+                best_score = score
+                best_pred = calibrated
+                best_weights = w
+    else:
+        rng = np.random.default_rng(random_state)
+        for _ in range(max(0, int(random_trials))):
+            log_w = rng.normal(0.0, 0.35, size=n_classes)
+            w = np.exp(log_w).astype(np.float32)
+            calibrated = _apply_class_probability_weights(base_proba, w)
+            score = float(_score_predictions(y_arr, calibrated))
+            evaluated += 1
+            if score > best_score + 1e-10:
+                best_score = score
+                best_pred = calibrated
+                best_weights = w
+
+    return best_pred.astype(np.float32), best_weights.astype(np.float32), float(best_score), int(evaluated)
+
+
+def _apply_logit_bias_temperature(
+    pred: np.ndarray,
+    *,
+    bias: np.ndarray,
+    temperature: float,
+) -> np.ndarray:
+    proba = _ensure_proba_2d(np.asarray(pred), n_classes=int(len(bias))).astype(np.float32)
+    bias_arr = np.asarray(bias, dtype=np.float32).reshape(1, -1)
+    t = float(max(1e-4, temperature))
+    logits = np.log(np.clip(proba, 1e-9, 1.0)) / t
+    logits = logits + bias_arr
+    logits = logits - np.max(logits, axis=1, keepdims=True)
+    out = np.exp(logits).astype(np.float32)
+    out = out / np.clip(out.sum(axis=1, keepdims=True), 1e-9, None)
+    return out.astype(np.float32)
+
+
+def _optimize_logit_bias_temperature(
+    *,
+    y_true: np.ndarray,
+    pred: np.ndarray,
+    random_trials: int,
+    random_state: int,
+) -> tuple[np.ndarray, np.ndarray, float, float, int]:
+    y_arr = np.asarray(y_true).astype(np.int32).reshape(-1)
+    n_classes = int(np.max(y_arr)) + 1 if y_arr.size else 0
+    if n_classes <= 1:
+        proba = _ensure_proba_2d(np.asarray(pred), n_classes=max(1, n_classes)).astype(np.float32)
+        return proba, np.zeros(max(1, n_classes), dtype=np.float32), 1.0, _score_predictions(y_arr, proba), 0
+
+    base_proba = _ensure_proba_2d(np.asarray(pred), n_classes=n_classes).astype(np.float32)
+    best_pred = base_proba
+    best_bias = np.zeros(n_classes, dtype=np.float32)
+    best_temp = 1.0
+    best_score = float(_score_predictions(y_arr, best_pred))
+    evaluated = 0
+
+    bias_grid = (-0.35, -0.25, -0.15, -0.08, 0.0, 0.08, 0.15, 0.25, 0.35)
+    temp_grid = (0.65, 0.80, 0.90, 1.00, 1.10, 1.25, 1.40)
+    if n_classes <= 4:
+        for temp in temp_grid:
+            if n_classes == 2:
+                for b1 in bias_grid:
+                    b = np.array([0.0, float(b1)], dtype=np.float32)
+                    calibrated = _apply_logit_bias_temperature(base_proba, bias=b, temperature=float(temp))
+                    score = float(_score_predictions(y_arr, calibrated))
+                    evaluated += 1
+                    if score > best_score + 1e-10:
+                        best_score = score
+                        best_pred = calibrated
+                        best_bias = b
+                        best_temp = float(temp)
+            elif n_classes == 3:
+                for b1, b2 in itertools.product(bias_grid, repeat=2):
+                    b = np.array([0.0, float(b1), float(b2)], dtype=np.float32)
+                    calibrated = _apply_logit_bias_temperature(base_proba, bias=b, temperature=float(temp))
+                    score = float(_score_predictions(y_arr, calibrated))
+                    evaluated += 1
+                    if score > best_score + 1e-10:
+                        best_score = score
+                        best_pred = calibrated
+                        best_bias = b
+                        best_temp = float(temp)
+            else:
+                for b1, b2, b3 in itertools.product(bias_grid, repeat=3):
+                    b = np.array([0.0, float(b1), float(b2), float(b3)], dtype=np.float32)
+                    calibrated = _apply_logit_bias_temperature(base_proba, bias=b, temperature=float(temp))
+                    score = float(_score_predictions(y_arr, calibrated))
+                    evaluated += 1
+                    if score > best_score + 1e-10:
+                        best_score = score
+                        best_pred = calibrated
+                        best_bias = b
+                        best_temp = float(temp)
+
+    rng = np.random.default_rng(random_state)
+    ref_scale = 0.28
+    for _ in range(max(0, int(random_trials))):
+        bias = np.zeros(n_classes, dtype=np.float32)
+        bias[1:] = rng.normal(0.0, ref_scale, size=n_classes - 1).astype(np.float32)
+        temp = float(np.exp(rng.normal(0.0, 0.22)))
+        calibrated = _apply_logit_bias_temperature(base_proba, bias=bias, temperature=temp)
+        score = float(_score_predictions(y_arr, calibrated))
+        evaluated += 1
+        if score > best_score + 1e-10:
+            best_score = score
+            best_pred = calibrated
+            best_bias = bias
+            best_temp = float(temp)
+            ref_scale = max(0.12, ref_scale * 0.95)
+
+    return (
+        best_pred.astype(np.float32),
+        best_bias.astype(np.float32),
+        float(best_temp),
+        float(best_score),
+        int(evaluated),
+    )
 
 
 def _proba_to_labels(pred: np.ndarray, class_labels: list[str]) -> np.ndarray:
@@ -374,7 +605,7 @@ def _save_model_outputs(
     family_name: str | None = None,
 ) -> dict[str, object]:
     valid_auc = _score_predictions(y_valid, valid_pred)
-    pred_tag = f"{model_name}_{cfg.feature_set_name}"
+    pred_tag = f"{model_name}_{_pred_run_tag(cfg)}"
     np.save(paths.oof_dir / f"oof_{pred_tag}.npy", valid_pred.astype(np.float32))
     np.save(paths.pred_dir / f"pred_{pred_tag}.npy", test_pred.astype(np.float32))
 
@@ -419,6 +650,10 @@ def _short_exc(exc: Exception, max_len: int = 240) -> str:
     if len(first_line) > max_len:
         return first_line[:max_len] + "..."
     return first_line
+
+
+def _pred_run_tag(cfg: BaselineConfig) -> str:
+    return f"{cfg.feature_set_name}_rs{int(cfg.random_state)}"
 
 
 def _cleanup_stale_artifacts(paths, cfg: BaselineConfig) -> None:
@@ -490,11 +725,11 @@ def _gpu_preflight_library(library_name: str) -> tuple[bool, str]:
     y_np = (np.random.RandomState(7).rand(128) > 0.5).astype(np.float32)
 
     try:
-        if library_name == "xgboost":
+        if library_name in {"xgboost", "xgboost_dart"}:
             if XGBClassifier is None:
                 result = (False, "xgboost not installed")
             else:
-                model = XGBClassifier(
+                params = dict(
                     objective="binary:logistic",
                     eval_metric="auc",
                     device="cuda",
@@ -507,6 +742,9 @@ def _gpu_preflight_library(library_name: str) -> tuple[bool, str]:
                     n_jobs=1,
                     random_state=42,
                 )
+                if library_name == "xgboost_dart":
+                    params.update({"booster": "dart", "rate_drop": 0.1, "skip_drop": 0.4})
+                model = XGBClassifier(**params)
                 model.fit(cp.asarray(x_np), y_np)
                 _ = model.predict_proba(cp.asarray(x_np))
                 result = (True, "ok")
@@ -528,7 +766,7 @@ def _gpu_preflight_library(library_name: str) -> tuple[bool, str]:
                 _ = model.predict_proba(x_np)
                 result = (True, "ok")
 
-        elif library_name == "catboost":
+        elif library_name in {"catboost", "catboost_native"}:
             if CatBoostClassifier is None:
                 result = (False, "catboost not installed")
             else:
@@ -1251,7 +1489,7 @@ def _run_deep_level2_stack(
             level2_valid_cols[pred_col] = valid_pred.astype(np.float32)
             level2_test_cols[pred_col] = test_pred.astype(np.float32)
 
-            pred_tag = f"{model_name}_{cfg.feature_set_name}"
+            pred_tag = f"{model_name}_{_pred_run_tag(cfg)}"
             np.save(paths.oof_dir / f"oof_{pred_tag}.npy", valid_pred.astype(np.float32))
             np.save(paths.pred_dir / f"pred_{pred_tag}.npy", test_pred.astype(np.float32))
 
@@ -1277,6 +1515,67 @@ def _xgboost_variant_grid(seed: int, n_models: int) -> list[dict[str, object]]:
         {"n_estimators": 110, "learning_rate": 0.07, "max_depth": 5, "subsample": 0.80, "colsample_bytree": 0.90},
         {"n_estimators": 160, "learning_rate": 0.035, "max_depth": 4, "subsample": 0.75, "colsample_bytree": 0.95},
         {"n_estimators": 130, "learning_rate": 0.06, "max_depth": 3, "subsample": 0.95, "colsample_bytree": 0.75},
+    ]
+    out: list[dict[str, object]] = []
+    for idx in range(max(1, n_models)):
+        base = presets[idx % len(presets)].copy()
+        base["random_state"] = seed + idx
+        out.append(base)
+    return out
+
+
+def _xgboost_dart_variant_grid(seed: int, n_models: int) -> list[dict[str, object]]:
+    presets = [
+        {
+            "n_estimators": 220,
+            "learning_rate": 0.05,
+            "max_depth": 4,
+            "subsample": 0.85,
+            "colsample_bytree": 0.85,
+            "booster": "dart",
+            "rate_drop": 0.10,
+            "skip_drop": 0.40,
+        },
+        {
+            "n_estimators": 260,
+            "learning_rate": 0.04,
+            "max_depth": 5,
+            "subsample": 0.80,
+            "colsample_bytree": 0.90,
+            "booster": "dart",
+            "rate_drop": 0.08,
+            "skip_drop": 0.30,
+        },
+        {
+            "n_estimators": 200,
+            "learning_rate": 0.06,
+            "max_depth": 4,
+            "subsample": 0.90,
+            "colsample_bytree": 0.80,
+            "booster": "dart",
+            "rate_drop": 0.12,
+            "skip_drop": 0.50,
+        },
+        {
+            "n_estimators": 300,
+            "learning_rate": 0.035,
+            "max_depth": 5,
+            "subsample": 0.78,
+            "colsample_bytree": 0.92,
+            "booster": "dart",
+            "rate_drop": 0.06,
+            "skip_drop": 0.25,
+        },
+        {
+            "n_estimators": 240,
+            "learning_rate": 0.045,
+            "max_depth": 3,
+            "subsample": 0.95,
+            "colsample_bytree": 0.75,
+            "booster": "dart",
+            "rate_drop": 0.10,
+            "skip_drop": 0.35,
+        },
     ]
     out: list[dict[str, object]] = []
     for idx in range(max(1, n_models)):
@@ -1369,9 +1668,13 @@ def _cuml_et_variant_grid(seed: int, n_models: int) -> list[dict[str, object]]:
 def _tree_variant_grid(library_name: str, seed: int, n_models: int) -> list[dict[str, object]]:
     if library_name == "xgboost":
         return _xgboost_variant_grid(seed=seed, n_models=n_models)
+    if library_name == "xgboost_dart":
+        return _xgboost_dart_variant_grid(seed=seed, n_models=n_models)
     if library_name == "lightgbm":
         return _lightgbm_variant_grid(seed=seed, n_models=n_models)
     if library_name == "catboost":
+        return _catboost_variant_grid(seed=seed, n_models=n_models)
+    if library_name == "catboost_native":
         return _catboost_variant_grid(seed=seed, n_models=n_models)
     if library_name == "ydf":
         return _ydf_style_variant_grid(seed=seed, n_models=n_models)
@@ -1382,8 +1685,196 @@ def _tree_variant_grid(library_name: str, seed: int, n_models: int) -> list[dict
     raise ValueError(f"Unsupported tree library '{library_name}'.")
 
 
+def _subsample_rows_for_tuning(
+    x_train: pd.DataFrame,
+    y_train: np.ndarray,
+    max_rows: int,
+    random_state: int,
+) -> tuple[pd.DataFrame, np.ndarray]:
+    if max_rows <= 0 or len(y_train) <= max_rows:
+        return x_train, y_train
+    idx_all = np.arange(len(y_train))
+    y_arr = np.asarray(y_train).astype(np.int32)
+    try:
+        idx_keep, _ = train_test_split(
+            idx_all,
+            train_size=max_rows,
+            random_state=random_state,
+            stratify=y_arr,
+        )
+    except Exception:
+        rng = np.random.default_rng(random_state)
+        idx_keep = rng.choice(idx_all, size=max_rows, replace=False)
+    idx_keep = np.asarray(idx_keep, dtype=np.int64)
+    return x_train.iloc[idx_keep].copy(), y_arr[idx_keep]
+
+
+def _optuna_suggest_tree_params(
+    library_name: str,
+    trial,
+    base_seed: int,
+) -> dict[str, object]:
+    if library_name in {"xgboost", "xgboost_dart"}:
+        params = {
+            "n_estimators": int(trial.suggest_int("n_estimators", 110, 360)),
+            "learning_rate": float(trial.suggest_float("learning_rate", 0.02, 0.12, log=True)),
+            "max_depth": int(trial.suggest_int("max_depth", 3, 8)),
+            "subsample": float(trial.suggest_float("subsample", 0.70, 1.00)),
+            "colsample_bytree": float(trial.suggest_float("colsample_bytree", 0.70, 1.00)),
+            "min_child_weight": float(trial.suggest_float("min_child_weight", 0.5, 12.0, log=True)),
+            "gamma": float(trial.suggest_float("gamma", 0.0, 3.0)),
+            "reg_lambda": float(trial.suggest_float("reg_lambda", 0.5, 15.0, log=True)),
+            "random_state": int(base_seed + trial.number),
+        }
+        if library_name == "xgboost_dart":
+            params.update(
+                {
+                    "booster": "dart",
+                    "rate_drop": float(trial.suggest_float("rate_drop", 0.03, 0.25)),
+                    "skip_drop": float(trial.suggest_float("skip_drop", 0.10, 0.60)),
+                }
+            )
+        return params
+    if library_name == "catboost":
+        return {
+            "iterations": int(trial.suggest_int("iterations", 120, 420)),
+            "learning_rate": float(trial.suggest_float("learning_rate", 0.02, 0.12, log=True)),
+            "depth": int(trial.suggest_int("depth", 4, 9)),
+            "l2_leaf_reg": float(trial.suggest_float("l2_leaf_reg", 1.0, 20.0, log=True)),
+            "random_strength": float(trial.suggest_float("random_strength", 0.1, 5.0)),
+            "bagging_temperature": float(trial.suggest_float("bagging_temperature", 0.0, 1.0)),
+            "random_seed": int(base_seed + trial.number),
+        }
+    if library_name == "lightgbm":
+        return {
+            "n_estimators": int(trial.suggest_int("n_estimators", 120, 420)),
+            "learning_rate": float(trial.suggest_float("learning_rate", 0.02, 0.12, log=True)),
+            "num_leaves": int(trial.suggest_int("num_leaves", 31, 191)),
+            "min_child_samples": int(trial.suggest_int("min_child_samples", 16, 140)),
+            "subsample": float(trial.suggest_float("subsample", 0.70, 1.00)),
+            "colsample_bytree": float(trial.suggest_float("colsample_bytree", 0.70, 1.00)),
+            "reg_lambda": float(trial.suggest_float("reg_lambda", 0.2, 12.0, log=True)),
+            "random_state": int(base_seed + trial.number),
+        }
+    return {}
+
+
+def _optuna_tuned_tree_variants(
+    *,
+    cfg: BaselineConfig,
+    library_name: str,
+    seed: int,
+    x_train: pd.DataFrame,
+    y_train: np.ndarray,
+    x_valid: pd.DataFrame,
+    y_valid: np.ndarray,
+) -> list[dict[str, object]]:
+    if not cfg.use_tree_optuna or cfg.tree_optuna_trials_per_library <= 0:
+        return []
+    if optuna is None or TPESampler is None:
+        print(f"[TREE_SUITE][WARN] Optuna unavailable; skipping tuning for '{library_name}'.")
+        return []
+    if library_name not in {"xgboost", "xgboost_dart", "catboost", "lightgbm"}:
+        return []
+    ok, reason = _gpu_preflight_library(library_name)
+    if not ok:
+        print(f"[TREE_SUITE][WARN] Optuna skipped for '{library_name}': {reason}")
+        return []
+
+    x_train_tune, y_train_tune = _subsample_rows_for_tuning(
+        x_train=x_train,
+        y_train=y_train,
+        max_rows=int(cfg.tree_optuna_train_max_rows),
+        random_state=seed + 17,
+    )
+    tune_sample_weight = None
+    if cfg.use_balanced_sample_weight:
+        tune_sample_weight, _ = _compute_balanced_sample_weight(
+            y_train_tune,
+            min_ratio=cfg.min_sample_weight_ratio,
+            max_ratio=cfg.max_sample_weight_ratio,
+        )
+    x_test_dummy = x_valid
+    error_counts: dict[str, int] = {}
+    max_error_logs = 3
+
+    def _objective(trial) -> float:
+        params = _optuna_suggest_tree_params(library_name=library_name, trial=trial, base_seed=seed + 1000)
+        if not params:
+            return 0.0
+        try:
+            _, valid_pred, _, _ = _fit_tree_library_model(
+                library_name=library_name,
+                params=params,
+                x_train=x_train_tune,
+                y_train=y_train_tune,
+                x_valid=x_valid,
+                x_test=x_test_dummy,
+                random_state=seed + trial.number,
+                sample_weight=tune_sample_weight,
+            )
+            score = float(_score_predictions(y_valid, valid_pred))
+            trial.set_user_attr("params", params)
+            return score
+        except Exception as exc:
+            err = _short_exc(exc)
+            trial.set_user_attr("error", err)
+            error_counts[err] = error_counts.get(err, 0) + 1
+            if sum(error_counts.values()) <= max_error_logs:
+                print(f"[TREE_SUITE][WARN] Optuna trial failed for '{library_name}': {err}")
+            return 0.0
+
+    timeout = None
+    if int(cfg.tree_optuna_timeout_sec) > 0:
+        timeout = int(cfg.tree_optuna_timeout_sec)
+    study = optuna.create_study(
+        direction="maximize",
+        sampler=TPESampler(seed=seed + 701),
+    )
+    study.optimize(
+        _objective,
+        n_trials=int(cfg.tree_optuna_trials_per_library),
+        timeout=timeout,
+        show_progress_bar=False,
+    )
+    failed_trials = [t for t in study.trials if "error" in t.user_attrs]
+    if failed_trials:
+        top_errors = sorted(error_counts.items(), key=lambda kv: kv[1], reverse=True)[:3]
+        err_msg = "; ".join(f"{msg} (x{count})" for msg, count in top_errors)
+        print(
+            f"[TREE_SUITE][WARN] Optuna failures for '{library_name}': "
+            f"{len(failed_trials)}/{len(study.trials)} trials. Top errors: {err_msg}"
+        )
+        if len(failed_trials) == len(study.trials):
+            print(f"[TREE_SUITE][WARN] All Optuna trials failed for '{library_name}', skipping tuned variants.")
+            return []
+
+    tuned: list[dict[str, object]] = []
+    seen: set[str] = set()
+    max_models = max(0, int(cfg.tree_optuna_max_tuned_models_per_library))
+    for tr in sorted(study.trials, key=lambda t: float(t.value or 0.0), reverse=True):
+        if len(tuned) >= max_models:
+            break
+        params = tr.user_attrs.get("params")
+        if not isinstance(params, dict):
+            continue
+        key = json.dumps(params, sort_keys=True)
+        if key in seen:
+            continue
+        seen.add(key)
+        tuned.append(dict(params))
+
+    if tuned:
+        best = float(study.best_value) if study.best_value is not None else float("nan")
+        print(
+            f"[TREE_SUITE] Optuna tuned '{library_name}' | trials={cfg.tree_optuna_trials_per_library} "
+            f"| keep={len(tuned)} | best_valid_auc={best:.6f}"
+        )
+    return tuned
+
+
 def _resolve_available_gpu_libraries(libraries: tuple[str, ...], *, strict_gpu_only: bool = True) -> tuple[str, ...]:
-    known = {"xgboost", "lightgbm", "catboost", "ydf", "cuml_rf", "cuml_et"}
+    known = {"xgboost", "xgboost_dart", "lightgbm", "catboost", "catboost_native", "ydf", "cuml_rf", "cuml_et"}
     unknown = sorted([name for name in libraries if name not in known])
     if unknown:
         raise ValueError(f"Unsupported tree libraries requested: {', '.join(unknown)}")
@@ -1423,6 +1914,32 @@ def _resolve_available_gpu_libraries(libraries: tuple[str, ...], *, strict_gpu_o
     return tuple(available)
 
 
+def _prepare_catboost_native_inputs(
+    train_df: pd.DataFrame,
+    valid_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    target_col: str,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, list[int], list[str]]:
+    candidate_cols = [c for c in train_df.columns if c not in {target_col, "cv_fold"}]
+    x_train_raw = train_df[candidate_cols].copy()
+    x_valid_raw = valid_df[candidate_cols].copy()
+    x_test_raw = test_df[candidate_cols].copy()
+    cat_feature_idx: list[int] = []
+
+    for idx, col in enumerate(candidate_cols):
+        if pd.api.types.is_numeric_dtype(x_train_raw[col]):
+            x_train_raw[col] = pd.to_numeric(x_train_raw[col], errors="coerce").fillna(0.0).astype(np.float32)
+            x_valid_raw[col] = pd.to_numeric(x_valid_raw[col], errors="coerce").fillna(0.0).astype(np.float32)
+            x_test_raw[col] = pd.to_numeric(x_test_raw[col], errors="coerce").fillna(0.0).astype(np.float32)
+            continue
+        cat_feature_idx.append(idx)
+        x_train_raw[col] = x_train_raw[col].astype("string").fillna("__NA__").astype(str)
+        x_valid_raw[col] = x_valid_raw[col].astype("string").fillna("__NA__").astype(str)
+        x_test_raw[col] = x_test_raw[col].astype("string").fillna("__NA__").astype(str)
+
+    return x_train_raw, x_valid_raw, x_test_raw, cat_feature_idx, candidate_cols
+
+
 def _fit_tree_library_model(
     library_name: str,
     params: dict[str, object],
@@ -1431,7 +1948,54 @@ def _fit_tree_library_model(
     x_valid: pd.DataFrame,
     x_test: pd.DataFrame,
     random_state: int,
+    sample_weight: np.ndarray | None = None,
+    raw_train_df: pd.DataFrame | None = None,
+    raw_valid_df: pd.DataFrame | None = None,
+    raw_test_df: pd.DataFrame | None = None,
+    target_col: str = "Irrigation_Need",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, str]:
+    y_train_np = y_train.astype(np.int32)
+    sample_weight_np = None if sample_weight is None else np.asarray(sample_weight, dtype=np.float32).reshape(-1)
+    n_classes = int(np.max(y_train_np)) + 1
+
+    if library_name == "catboost_native":
+        if CatBoostClassifier is None:
+            raise RuntimeError("catboost is not installed.")
+        if raw_train_df is None or raw_valid_df is None or raw_test_df is None:
+            raise RuntimeError("catboost_native requires raw split DataFrames.")
+
+        x_train_raw, x_valid_raw, x_test_raw, cat_feature_idx, _ = _prepare_catboost_native_inputs(
+            train_df=raw_train_df,
+            valid_df=raw_valid_df,
+            test_df=raw_test_df,
+            target_col=target_col,
+        )
+        cat_params = dict(
+            task_type="GPU",
+            devices="0",
+            allow_writing_files=False,
+            verbose=False,
+            one_hot_max_size=64,
+            **params,
+        )
+        if n_classes > 2:
+            cat_params.update({"loss_function": "MultiClass", "eval_metric": "MultiClass"})
+        else:
+            cat_params.update({"loss_function": "Logloss", "eval_metric": "AUC"})
+        model = CatBoostClassifier(**cat_params)
+        model.fit(
+            x_train_raw,
+            y_train_np,
+            cat_features=cat_feature_idx,
+            sample_weight=sample_weight_np,
+        )
+        return (
+            _predict_score(model, x_train_raw, n_classes=n_classes),
+            _predict_score(model, x_valid_raw, n_classes=n_classes),
+            _predict_score(model, x_test_raw, n_classes=n_classes),
+            "catboost_native_gpu",
+        )
+
     if cp is None:
         raise RuntimeError("GPU-only mode requires cupy.")
 
@@ -1439,21 +2003,20 @@ def _fit_tree_library_model(
     x_valid_gpu = _to_cupy_frame(x_valid)
     x_test_gpu = _to_cupy_frame(x_test)
     y_train_gpu = _to_cupy_target(y_train)
-    y_train_np = y_train.astype(np.int32)
-    n_classes = int(np.max(y_train_np)) + 1
 
-    if library_name == "xgboost":
+    if library_name in {"xgboost", "xgboost_dart"}:
         if XGBClassifier is None:
             raise RuntimeError("xgboost is not installed.")
-        xgb_params = dict(
-            device="cuda",
-            tree_method="hist",
-            n_jobs=-1,
-            reg_lambda=1.0,
-            min_child_weight=1.0,
-            gamma=0.0,
-            **params,
-        )
+        xgb_params: dict[str, object] = {
+            "device": "cuda",
+            "tree_method": "hist",
+            "n_jobs": -1,
+            "reg_lambda": 1.0,
+            "min_child_weight": 1.0,
+            "gamma": 0.0,
+        }
+        xgb_params.update(params)
+        xgb_params.setdefault("random_state", int(random_state))
         if n_classes > 2:
             xgb_params.update(
                 {
@@ -1464,16 +2027,37 @@ def _fit_tree_library_model(
             )
         else:
             xgb_params.update({"objective": "binary:logistic", "eval_metric": "auc"})
-        model = XGBClassifier(
-            **xgb_params,
-        )
-        model.fit(x_train_gpu, y_train_np)
-        return (
-            _predict_score(model, x_train_gpu, n_classes=n_classes),
-            _predict_score(model, x_valid_gpu, n_classes=n_classes),
-            _predict_score(model, x_test_gpu, n_classes=n_classes),
-            "xgboost_gpu_cuda",
-        )
+        model = XGBClassifier(**xgb_params)
+        try:
+            model.fit(x_train_gpu, y_train_np, sample_weight=sample_weight_np)
+            return (
+                _predict_score(model, x_train_gpu, n_classes=n_classes),
+                _predict_score(model, x_valid_gpu, n_classes=n_classes),
+                _predict_score(model, x_test_gpu, n_classes=n_classes),
+                "xgboost_dart_gpu_cuda" if library_name == "xgboost_dart" else "xgboost_gpu_cuda",
+            )
+        except Exception as gpu_exc:
+            # Some environments fail with CuPy matrix input despite working GPU training.
+            x_train_np = cp.asnumpy(x_train_gpu)
+            x_valid_np = cp.asnumpy(x_valid_gpu)
+            x_test_np = cp.asnumpy(x_test_gpu)
+            model = XGBClassifier(**xgb_params)
+            try:
+                model.fit(x_train_np, y_train_np, sample_weight=sample_weight_np)
+                return (
+                    _predict_score(model, x_train_np, n_classes=n_classes),
+                    _predict_score(model, x_valid_np, n_classes=n_classes),
+                    _predict_score(model, x_test_np, n_classes=n_classes),
+                    (
+                        "xgboost_dart_gpu_cuda_numpy_input_fallback"
+                        if library_name == "xgboost_dart"
+                        else "xgboost_gpu_cuda_numpy_input_fallback"
+                    ),
+                )
+            except Exception as np_exc:
+                raise RuntimeError(
+                    f"XGBoost GPU fit failed (cupy input: {_short_exc(gpu_exc)}; numpy input: {_short_exc(np_exc)})"
+                ) from np_exc
 
     if library_name == "lightgbm":
         if LGBMClassifier is None:
@@ -1495,7 +2079,7 @@ def _fit_tree_library_model(
         x_train_np = cp.asnumpy(x_train_gpu)
         x_valid_np = cp.asnumpy(x_valid_gpu)
         x_test_np = cp.asnumpy(x_test_gpu)
-        model.fit(x_train_np, y_train_np)
+        model.fit(x_train_np, y_train_np, sample_weight=sample_weight_np)
         return (
             _predict_score(model, x_train_np, n_classes=n_classes),
             _predict_score(model, x_valid_np, n_classes=n_classes),
@@ -1523,7 +2107,7 @@ def _fit_tree_library_model(
         x_train_np = cp.asnumpy(x_train_gpu)
         x_valid_np = cp.asnumpy(x_valid_gpu)
         x_test_np = cp.asnumpy(x_test_gpu)
-        model.fit(x_train_np, y_train_np)
+        model.fit(x_train_np, y_train_np, sample_weight=sample_weight_np)
         return (
             _predict_score(model, x_train_np, n_classes=n_classes),
             _predict_score(model, x_valid_np, n_classes=n_classes),
@@ -1567,6 +2151,7 @@ def _save_tree_suite_artifacts(
     level2_test: pd.DataFrame,
     suite_metrics: list[dict[str, object]],
     libraries_requested: list[str],
+    sample_weight_by_class: dict[int, float] | None = None,
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     _save_parquet(level2_train, out_dir / "level2_train.parquet")
@@ -1596,10 +2181,25 @@ def _save_tree_suite_artifacts(
         "level3_definition": "xgboost_on_level1_plus_level2_outputs",
         "level4_definition": "l2_logistic_meta_model_on_level2_plus_level3_outputs",
         "models_per_library": cfg.models_per_library,
+        "use_tree_optuna": bool(cfg.use_tree_optuna),
+        "tree_optuna_trials_per_library": int(cfg.tree_optuna_trials_per_library),
+        "tree_optuna_max_tuned_models_per_library": int(cfg.tree_optuna_max_tuned_models_per_library),
         "min_tree_valid_auc_keep": float(cfg.min_tree_valid_auc_keep),
         "min_deep_valid_auc_keep": float(cfg.min_deep_valid_auc_keep),
+        "level2_keep_top_models_for_meta": int(cfg.level2_keep_top_models_for_meta),
+        "level2_keep_min_models_for_meta": int(cfg.level2_keep_min_models_for_meta),
+        "level2_keep_model_auc_gap": float(cfg.level2_keep_model_auc_gap),
         "min_oof_auc_for_selection": float(cfg.min_oof_auc_for_selection),
         "stacking_min_models": int(cfg.stacking_min_models),
+        "use_balanced_sample_weight": bool(cfg.use_balanced_sample_weight),
+        "min_sample_weight_ratio": float(cfg.min_sample_weight_ratio),
+        "max_sample_weight_ratio": float(cfg.max_sample_weight_ratio),
+        "sample_weight_by_class": {
+            str(k): float(v) for k, v in (sample_weight_by_class or {}).items()
+        },
+        "enable_class_weight_calibration": bool(cfg.enable_class_weight_calibration),
+        "class_weight_calibration_grid": [float(v) for v in cfg.class_weight_calibration_grid],
+        "class_weight_calibration_random_trials": int(cfg.class_weight_calibration_random_trials),
         "libraries_requested": libraries_requested,
         "libraries_completed": sorted(list({str(m["library"]) for m in suite_metrics})),
         "library_summary": library_summary,
@@ -1610,6 +2210,94 @@ def _save_tree_suite_artifacts(
     (out_dir / "tree_suite_metrics.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
 
+def _model_name_to_l1_prefix(model_name: str) -> str | None:
+    name = str(model_name).strip()
+    if "_m" not in name:
+        return None
+    library_part, model_idx = name.rsplit("_m", 1)
+    if not model_idx.isdigit():
+        return None
+    return f"l1_pred__{library_part}__m{int(model_idx)}"
+
+
+def _select_level2_prediction_columns_for_meta(
+    cfg: BaselineConfig,
+    suite_metrics: list[dict[str, object]],
+    level2_columns: list[str],
+) -> tuple[list[str], dict[str, object]]:
+    all_pred_cols = sorted([c for c in level2_columns if c.startswith("l1_pred__")])
+    info: dict[str, object] = {
+        "total_pred_columns": int(len(all_pred_cols)),
+        "selected_pred_columns": int(len(all_pred_cols)),
+        "total_candidate_models": 0,
+        "selected_models": 0,
+        "best_model_auc": None,
+        "auc_gap": float(cfg.level2_keep_model_auc_gap),
+        "selected_model_names": [],
+    }
+    if not all_pred_cols or not suite_metrics:
+        return all_pred_cols, info
+
+    model_rows: list[dict[str, object]] = []
+    for row in suite_metrics:
+        prefix = _model_name_to_l1_prefix(str(row.get("model_name", "")))
+        if not prefix:
+            continue
+        try:
+            valid_auc = float(row.get("valid_auc"))
+        except Exception:
+            continue
+        model_pred_cols = [c for c in all_pred_cols if c == prefix or c.startswith(prefix + "__")]
+        if not model_pred_cols:
+            continue
+        model_rows.append(
+            {
+                "model_name": str(row.get("model_name", "")),
+                "valid_auc": valid_auc,
+                "cols": model_pred_cols,
+            }
+        )
+
+    if not model_rows:
+        return all_pred_cols, info
+
+    model_rows.sort(key=lambda x: float(x["valid_auc"]), reverse=True)
+    best_auc = float(model_rows[0]["valid_auc"])
+    auc_gap = max(0.0, float(cfg.level2_keep_model_auc_gap))
+    top_cap = max(0, int(cfg.level2_keep_top_models_for_meta))
+    min_keep = max(1, int(cfg.level2_keep_min_models_for_meta))
+
+    kept_rows = [row for row in model_rows if float(row["valid_auc"]) >= (best_auc - auc_gap - 1e-12)]
+    if top_cap > 0 and len(kept_rows) > top_cap:
+        kept_rows = kept_rows[:top_cap]
+
+    target_min = min(min_keep, len(model_rows))
+    if len(kept_rows) < target_min:
+        kept_names = {str(row["model_name"]) for row in kept_rows}
+        for row in model_rows:
+            if str(row["model_name"]) in kept_names:
+                continue
+            kept_rows.append(row)
+            kept_names.add(str(row["model_name"]))
+            if len(kept_rows) >= target_min:
+                break
+
+    selected_cols = sorted({col for row in kept_rows for col in row["cols"]})
+    if not selected_cols:
+        selected_cols = all_pred_cols
+
+    info.update(
+        {
+            "selected_pred_columns": int(len(selected_cols)),
+            "total_candidate_models": int(len(model_rows)),
+            "selected_models": int(len(kept_rows)),
+            "best_model_auc": float(best_auc),
+            "selected_model_names": [str(row["model_name"]) for row in kept_rows],
+        }
+    )
+    return selected_cols, info
+
+
 def _train_level3_xgb(
     cfg: BaselineConfig,
     level2_train: pd.DataFrame,
@@ -1618,6 +2306,8 @@ def _train_level3_xgb(
     y_train: np.ndarray,
     y_valid: np.ndarray,
     out_dir: Path,
+    sample_weight: np.ndarray | None = None,
+    sample_weight_by_class: dict[int, float] | None = None,
 ) -> dict[str, object]:
     x_train_l3, x_valid_l3, x_test_l3, used_cols = _encode_level_features(
         train_df=level2_train,
@@ -1647,14 +2337,49 @@ def _train_level3_xgb(
         xgb_params.update({"objective": "multi:softprob", "eval_metric": "mlogloss", "num_class": int(n_classes)})
     else:
         xgb_params.update({"objective": "binary:logistic", "eval_metric": "auc"})
-    model = XGBClassifier(**xgb_params)
-    x_train_gpu = _to_cupy_frame(x_train_l3)
+    level3_weight = None if sample_weight is None else np.asarray(sample_weight, dtype=np.float32).reshape(-1)
     x_valid_gpu = _to_cupy_frame(x_valid_l3)
     x_test_gpu = _to_cupy_frame(x_test_l3)
-    model.fit(x_train_gpu, y_train.astype(np.int32))
-    valid_pred = _predict_score(model, x_valid_gpu, n_classes=n_classes)
-    test_pred = _predict_score(model, x_test_gpu, n_classes=n_classes)
-    backend = "xgboost_gpu_cuda"
+
+    use_cv = bool(cfg.level3_cv_enabled and int(cfg.level3_cv_folds) > 1)
+    cv_fold_scores: list[float] = []
+    if use_cv:
+        cv = StratifiedKFold(
+            n_splits=max(2, int(cfg.level3_cv_folds)),
+            shuffle=True,
+            random_state=cfg.random_state,
+        )
+        valid_fold_preds: list[np.ndarray] = []
+        test_fold_preds: list[np.ndarray] = []
+        for fold_idx, (tr_idx, va_idx) in enumerate(cv.split(x_train_l3, y_train)):
+            fold_params = dict(xgb_params)
+            fold_params["random_state"] = int(cfg.random_state + fold_idx)
+            model = XGBClassifier(**fold_params)
+
+            x_tr_gpu = _to_cupy_frame(x_train_l3.iloc[tr_idx])
+            x_va_gpu = _to_cupy_frame(x_train_l3.iloc[va_idx])
+            y_tr = y_train[tr_idx].astype(np.int32)
+            sw_tr = None if level3_weight is None else level3_weight[tr_idx]
+            model.fit(x_tr_gpu, y_tr, sample_weight=sw_tr)
+
+            fold_train_oof = _predict_score(model, x_va_gpu, n_classes=n_classes)
+            fold_train_score = _score_predictions(y_train[va_idx], fold_train_oof)
+            cv_fold_scores.append(float(fold_train_score))
+
+            valid_fold_preds.append(_predict_score(model, x_valid_gpu, n_classes=n_classes))
+            test_fold_preds.append(_predict_score(model, x_test_gpu, n_classes=n_classes))
+
+        valid_pred = np.mean(np.stack(valid_fold_preds, axis=0), axis=0).astype(np.float32)
+        test_pred = np.mean(np.stack(test_fold_preds, axis=0), axis=0).astype(np.float32)
+        backend = "xgboost_gpu_cuda_cv_ensemble"
+    else:
+        model = XGBClassifier(**xgb_params)
+        x_train_gpu = _to_cupy_frame(x_train_l3)
+        model.fit(x_train_gpu, y_train.astype(np.int32), sample_weight=level3_weight)
+        valid_pred = _predict_score(model, x_valid_gpu, n_classes=n_classes)
+        test_pred = _predict_score(model, x_test_gpu, n_classes=n_classes)
+        backend = "xgboost_gpu_cuda_single_fit"
+
     valid_auc = _score_predictions(y_valid, valid_pred)
 
     np.save(out_dir / "level3_valid_pred.npy", valid_pred.astype(np.float32))
@@ -1679,6 +2404,12 @@ def _train_level3_xgb(
             "subsample": cfg.level3_xgb_subsample,
             "colsample_bytree": cfg.level3_xgb_colsample_bytree,
             "random_state": cfg.random_state,
+            "cv_enabled": bool(use_cv),
+            "cv_folds": int(max(1, cfg.level3_cv_folds)),
+            "cv_fold_train_scores": [float(s) for s in cv_fold_scores],
+        },
+        "sample_weight_by_class": {
+            str(k): float(v) for k, v in (sample_weight_by_class or {}).items()
         },
     }
     (out_dir / "level3_final_metrics.json").write_text(json.dumps(final_metrics, indent=2), encoding="utf-8")
@@ -1688,8 +2419,9 @@ def _train_level3_xgb(
 def _build_level4_meta_features(
     level2_valid: pd.DataFrame,
     level2_test: pd.DataFrame,
-    level3_valid_pred: np.ndarray,
-    level3_test_pred: np.ndarray,
+    level3_valid_pred: np.ndarray | None = None,
+    level3_test_pred: np.ndarray | None = None,
+    include_level3: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, list[str]]:
     pred_cols = sorted([c for c in level2_valid.columns if c.startswith("l1_pred__")])
     if not pred_cols:
@@ -1698,15 +2430,22 @@ def _build_level4_meta_features(
     x_valid_l2 = level2_valid[pred_cols].fillna(0.0).astype(np.float32).to_numpy()
     x_test_l2 = level2_test[pred_cols].fillna(0.0).astype(np.float32).to_numpy()
 
-    l3_valid = np.asarray(level3_valid_pred)
-    l3_test = np.asarray(level3_test_pred)
-    if l3_valid.ndim == 1:
-        l3_valid = l3_valid.reshape(-1, 1)
-    if l3_test.ndim == 1:
-        l3_test = l3_test.reshape(-1, 1)
-    x_valid_meta = np.column_stack([x_valid_l2, l3_valid.astype(np.float32)])
-    x_test_meta = np.column_stack([x_test_l2, l3_test.astype(np.float32)])
-    meta_cols = pred_cols + [f"level3_xgb_pred_c{i}" for i in range(l3_valid.shape[1])]
+    if include_level3:
+        if level3_valid_pred is None or level3_test_pred is None:
+            raise RuntimeError("include_level3=True requires level3 predictions.")
+        l3_valid = np.asarray(level3_valid_pred)
+        l3_test = np.asarray(level3_test_pred)
+        if l3_valid.ndim == 1:
+            l3_valid = l3_valid.reshape(-1, 1)
+        if l3_test.ndim == 1:
+            l3_test = l3_test.reshape(-1, 1)
+        x_valid_meta = np.column_stack([x_valid_l2, l3_valid.astype(np.float32)])
+        x_test_meta = np.column_stack([x_test_l2, l3_test.astype(np.float32)])
+        meta_cols = pred_cols + [f"level3_xgb_pred_c{i}" for i in range(l3_valid.shape[1])]
+    else:
+        x_valid_meta = x_valid_l2
+        x_test_meta = x_test_l2
+        meta_cols = pred_cols
     return x_valid_meta, x_test_meta, meta_cols
 
 
@@ -1774,41 +2513,128 @@ def _fit_level4_xgb_meta_cv(
         raise RuntimeError("cupy not installed.")
 
     cv = StratifiedKFold(n_splits=max(2, n_splits), shuffle=True, random_state=random_state)
-    oof = np.zeros(x_valid.shape[0], dtype=np.float32)
+    y_arr = np.asarray(y_valid).astype(np.int32).reshape(-1)
+    n_classes = int(np.max(y_arr)) + 1
+    if n_classes > 2:
+        oof = np.zeros((x_valid.shape[0], n_classes), dtype=np.float32)
+    else:
+        oof = np.zeros(x_valid.shape[0], dtype=np.float32)
     test_preds: list[np.ndarray] = []
 
-    pos = float(np.sum(y_valid > 0.5))
-    neg = float(max(0, y_valid.shape[0] - pos))
+    pos = float(np.sum(y_arr > 0.5))
+    neg = float(max(0, y_arr.shape[0] - pos))
     scale_pos_weight = float(min(100.0, max(1.0, neg / max(1.0, pos))))
 
-    for fold_idx, (tr_idx, va_idx) in enumerate(cv.split(x_valid, y_valid)):
-        model = XGBClassifier(
-            objective="binary:logistic",
-            eval_metric="auc",
-            device="cuda",
-            tree_method="hist",
-            n_estimators=260,
-            learning_rate=0.05,
-            max_depth=3,
-            subsample=0.9,
-            colsample_bytree=0.9,
-            reg_lambda=2.0,
-            min_child_weight=4.0,
-            gamma=0.0,
-            scale_pos_weight=scale_pos_weight,
-            random_state=random_state + fold_idx,
-        )
+    for fold_idx, (tr_idx, va_idx) in enumerate(cv.split(x_valid, y_arr)):
+        model_params: dict[str, object] = {
+            "device": "cuda",
+            "tree_method": "hist",
+            "n_estimators": 260,
+            "learning_rate": 0.05,
+            "max_depth": 4,
+            "subsample": 0.9,
+            "colsample_bytree": 0.9,
+            "reg_lambda": 2.0,
+            "min_child_weight": 2.0,
+            "gamma": 0.0,
+            "random_state": random_state + fold_idx,
+        }
+        if n_classes > 2:
+            model_params.update(
+                {
+                    "objective": "multi:softprob",
+                    "eval_metric": "mlogloss",
+                    "num_class": int(n_classes),
+                }
+            )
+        else:
+            model_params.update(
+                {
+                    "objective": "binary:logistic",
+                    "eval_metric": "auc",
+                    "scale_pos_weight": scale_pos_weight,
+                }
+            )
+        model = XGBClassifier(**model_params)
         x_tr = cp.asarray(x_valid[tr_idx], dtype=cp.float32)
-        y_tr = y_valid[tr_idx].astype(np.int32)
+        y_tr = y_arr[tr_idx].astype(np.int32)
         x_va = cp.asarray(x_valid[va_idx], dtype=cp.float32)
         x_te = cp.asarray(x_test, dtype=cp.float32)
 
         model.fit(x_tr, y_tr)
-        oof[va_idx] = _predict_score(model, x_va).astype(np.float32)
-        test_preds.append(_predict_score(model, x_te).astype(np.float32))
+        va_pred = _predict_score(model, x_va, n_classes=n_classes).astype(np.float32)
+        te_pred = _predict_score(model, x_te, n_classes=n_classes).astype(np.float32)
+        if n_classes > 2:
+            oof[va_idx] = _ensure_proba_2d(va_pred, n_classes=n_classes)
+            test_preds.append(_ensure_proba_2d(te_pred, n_classes=n_classes))
+        else:
+            oof[va_idx] = va_pred.reshape(-1).astype(np.float32)
+            test_preds.append(te_pred.reshape(-1).astype(np.float32))
 
-    test_pred = np.mean(np.vstack(test_preds), axis=0).astype(np.float32)
+    if n_classes > 2:
+        test_pred = np.mean(np.stack(test_preds, axis=0), axis=0).astype(np.float32)
+    else:
+        test_pred = np.mean(np.vstack(test_preds), axis=0).astype(np.float32)
     return oof, test_pred, "xgboost_gpu_meta_cv"
+
+
+def _fit_level4_catboost_meta_cv(
+    x_valid: np.ndarray,
+    y_valid: np.ndarray,
+    x_test: np.ndarray,
+    n_splits: int,
+    random_state: int,
+) -> tuple[np.ndarray, np.ndarray, str]:
+    if CatBoostClassifier is None:
+        raise RuntimeError("catboost not installed.")
+
+    cv = StratifiedKFold(n_splits=max(2, n_splits), shuffle=True, random_state=random_state)
+    y_arr = np.asarray(y_valid).astype(np.int32).reshape(-1)
+    n_classes = int(np.max(y_arr)) + 1
+    if n_classes > 2:
+        oof = np.zeros((x_valid.shape[0], n_classes), dtype=np.float32)
+    else:
+        oof = np.zeros(x_valid.shape[0], dtype=np.float32)
+    test_preds: list[np.ndarray] = []
+
+    for fold_idx, (tr_idx, va_idx) in enumerate(cv.split(x_valid, y_arr)):
+        params: dict[str, object] = {
+            "task_type": "GPU",
+            "devices": "0",
+            "allow_writing_files": False,
+            "verbose": False,
+            "iterations": 360,
+            "learning_rate": 0.05,
+            "depth": 6,
+            "l2_leaf_reg": 4.0,
+            "random_strength": 1.0,
+            "bagging_temperature": 0.2,
+            "random_seed": random_state + fold_idx,
+        }
+        if n_classes > 2:
+            params.update({"loss_function": "MultiClass", "eval_metric": "MultiClass"})
+        else:
+            params.update({"loss_function": "Logloss", "eval_metric": "AUC"})
+
+        model = CatBoostClassifier(**params)
+        model.fit(
+            x_valid[tr_idx].astype(np.float32),
+            y_arr[tr_idx],
+        )
+        va_pred = _predict_score(model, x_valid[va_idx].astype(np.float32), n_classes=n_classes).astype(np.float32)
+        te_pred = _predict_score(model, x_test.astype(np.float32), n_classes=n_classes).astype(np.float32)
+        if n_classes > 2:
+            oof[va_idx] = _ensure_proba_2d(va_pred, n_classes=n_classes)
+            test_preds.append(_ensure_proba_2d(te_pred, n_classes=n_classes))
+        else:
+            oof[va_idx] = va_pred.reshape(-1).astype(np.float32)
+            test_preds.append(te_pred.reshape(-1).astype(np.float32))
+
+    if n_classes > 2:
+        test_pred = np.mean(np.stack(test_preds, axis=0), axis=0).astype(np.float32)
+    else:
+        test_pred = np.mean(np.vstack(test_preds), axis=0).astype(np.float32)
+    return oof, test_pred, "catboost_gpu_meta_cv"
 
 
 def _fit_level4_logistic_cv(
@@ -1824,16 +2650,19 @@ def _fit_level4_logistic_cv(
     n_classes = int(np.max(y_arr)) + 1
     oof = np.zeros((x_valid.shape[0], n_classes), dtype=np.float32)
     test_preds: list[np.ndarray] = []
+    supports_multi_class = "multi_class" in inspect.signature(LogisticRegression).parameters
 
     for fold_idx, (tr_idx, va_idx) in enumerate(cv.split(x_valid, y_arr)):
-        model = LogisticRegression(
-            C=float(c_value),
-            max_iter=1600,
-            class_weight="balanced",
-            solver="lbfgs",
-            multi_class="auto",
-            random_state=random_state + fold_idx,
-        )
+        model_kwargs = {
+            "C": float(c_value),
+            "max_iter": 1600,
+            "class_weight": "balanced",
+            "solver": "lbfgs",
+            "random_state": random_state + fold_idx,
+        }
+        if supports_multi_class:
+            model_kwargs["multi_class"] = "auto"
+        model = LogisticRegression(**model_kwargs)
         model.fit(x_valid[tr_idx], y_arr[tr_idx])
         va_pred = model.predict_proba(x_valid[va_idx]).astype(np.float32)
         te_pred = model.predict_proba(x_test).astype(np.float32)
@@ -1854,27 +2683,118 @@ def _train_level4_logit_stack(
 ) -> dict[str, object]:
     level3_valid_path = out_dir / "level3_valid_pred.npy"
     level3_test_path = out_dir / "level3_test_pred.npy"
-    if not level3_valid_path.exists() or not level3_test_path.exists():
-        raise FileNotFoundError("Level-4 stack requires level3 predictions, but they were not found.")
+    level3_available = level3_valid_path.exists() and level3_test_path.exists()
+    level3_valid_pred = np.load(level3_valid_path).astype(np.float32) if level3_available else None
+    level3_test_pred = np.load(level3_test_path).astype(np.float32) if level3_available else None
 
-    level3_valid_pred = np.load(level3_valid_path).astype(np.float32)
-    level3_test_pred = np.load(level3_test_path).astype(np.float32)
-    x_valid_meta, x_test_meta, meta_cols = _build_level4_meta_features(
+    feature_variants: list[tuple[str, np.ndarray, np.ndarray, list[str]]] = []
+    x_valid_l2_only, x_test_l2_only, meta_cols_l2_only = _build_level4_meta_features(
         level2_valid=level2_valid,
         level2_test=level2_test,
-        level3_valid_pred=level3_valid_pred,
-        level3_test_pred=level3_test_pred,
+        include_level3=False,
     )
+    feature_variants.append(("l2_only", x_valid_l2_only, x_test_l2_only, meta_cols_l2_only))
+    if level3_available:
+        x_valid_l3, x_test_l3, meta_cols_l3 = _build_level4_meta_features(
+            level2_valid=level2_valid,
+            level2_test=level2_test,
+            level3_valid_pred=level3_valid_pred,
+            level3_test_pred=level3_test_pred,
+            include_level3=True,
+        )
+        feature_variants.append(("l2_plus_l3", x_valid_l3, x_test_l3, meta_cols_l3))
 
-    oof_pred, test_pred, backend = _fit_level4_logistic_cv(
-        x_valid=x_valid_meta,
-        y_valid=y_valid,
-        x_test=x_test_meta,
-        n_splits=cfg.level4_cv_folds,
-        random_state=cfg.random_state,
-        c_value=cfg.level4_regularization_c,
-    )
-    valid_auc = _score_predictions(y_valid, oof_pred)
+    candidates: list[dict[str, object]] = []
+    c_grid = sorted(set([float(cfg.level4_regularization_c), 0.5, 1.0, 2.0, 4.0]))
+    for variant_name, x_valid_meta, x_test_meta, meta_cols in feature_variants:
+        for c_value in c_grid:
+            try:
+                oof_pred, test_pred, backend = _fit_level4_logistic_cv(
+                    x_valid=x_valid_meta,
+                    y_valid=y_valid,
+                    x_test=x_test_meta,
+                    n_splits=cfg.level4_cv_folds,
+                    random_state=cfg.random_state,
+                    c_value=float(c_value),
+                )
+                valid_auc = _score_predictions(y_valid, oof_pred)
+                candidates.append(
+                    {
+                        "variant": variant_name,
+                        "backend": backend,
+                        "regularization_c": float(c_value),
+                        "valid_auc": float(valid_auc),
+                        "oof_pred": oof_pred,
+                        "test_pred": test_pred,
+                        "meta_cols": meta_cols,
+                        "n_meta_features": int(x_valid_meta.shape[1]),
+                    }
+                )
+            except Exception as exc:
+                print(
+                    f"[LEVEL4][WARN] Logistic variant failed ({variant_name}, C={c_value:.3g}): {_short_exc(exc)}"
+                )
+
+        if XGBClassifier is not None and cp is not None:
+            try:
+                oof_pred, test_pred, backend = _fit_level4_xgb_meta_cv(
+                    x_valid=x_valid_meta,
+                    y_valid=y_valid,
+                    x_test=x_test_meta,
+                    n_splits=cfg.level4_cv_folds,
+                    random_state=cfg.random_state + 17,
+                )
+                valid_auc = _score_predictions(y_valid, oof_pred)
+                candidates.append(
+                    {
+                        "variant": variant_name,
+                        "backend": backend,
+                        "regularization_c": None,
+                        "valid_auc": float(valid_auc),
+                        "oof_pred": oof_pred,
+                        "test_pred": test_pred,
+                        "meta_cols": meta_cols,
+                        "n_meta_features": int(x_valid_meta.shape[1]),
+                    }
+                )
+            except Exception as exc:
+                print(f"[LEVEL4][WARN] XGBoost meta-CV failed ({variant_name}): {_short_exc(exc)}")
+
+        if CatBoostClassifier is not None:
+            try:
+                oof_pred, test_pred, backend = _fit_level4_catboost_meta_cv(
+                    x_valid=x_valid_meta,
+                    y_valid=y_valid,
+                    x_test=x_test_meta,
+                    n_splits=cfg.level4_cv_folds,
+                    random_state=cfg.random_state + 29,
+                )
+                valid_auc = _score_predictions(y_valid, oof_pred)
+                candidates.append(
+                    {
+                        "variant": variant_name,
+                        "backend": backend,
+                        "regularization_c": None,
+                        "valid_auc": float(valid_auc),
+                        "oof_pred": oof_pred,
+                        "test_pred": test_pred,
+                        "meta_cols": meta_cols,
+                        "n_meta_features": int(x_valid_meta.shape[1]),
+                    }
+                )
+            except Exception as exc:
+                print(f"[LEVEL4][WARN] CatBoost meta-CV failed ({variant_name}): {_short_exc(exc)}")
+
+    if not candidates:
+        raise RuntimeError("Level-4 stack failed: no valid meta-model candidate.")
+
+    best = max(candidates, key=lambda d: float(d["valid_auc"]))
+    oof_pred = np.asarray(best["oof_pred"], dtype=np.float32)
+    test_pred = np.asarray(best["test_pred"], dtype=np.float32)
+    backend = str(best["backend"])
+    valid_auc = float(best["valid_auc"])
+    meta_cols = list(best["meta_cols"])
+    n_meta_features = int(best["n_meta_features"])
 
     np.save(out_dir / "level4_valid_pred.npy", oof_pred.astype(np.float32))
     np.save(out_dir / "level4_test_pred.npy", test_pred.astype(np.float32))
@@ -1885,20 +2805,35 @@ def _train_level4_logit_stack(
         for c in range(oof_pred.shape[1]):
             valid_df[f"y_pred_c{c}"] = oof_pred[:, c].astype(np.float32)
     _save_parquet(valid_df, out_dir / "level4_valid_predictions.parquet")
-    np.save(paths.oof_dir / f"oof_level4_logit_{cfg.feature_set_name}.npy", oof_pred.astype(np.float32))
-    np.save(paths.pred_dir / f"pred_level4_logit_{cfg.feature_set_name}.npy", test_pred.astype(np.float32))
+    np.save(paths.oof_dir / f"oof_level4_logit_{_pred_run_tag(cfg)}.npy", oof_pred.astype(np.float32))
+    np.save(paths.pred_dir / f"pred_level4_logit_{_pred_run_tag(cfg)}.npy", test_pred.astype(np.float32))
 
     metrics = {
         "stage": "level4_final",
         "model_name": "kgmon_level4_l2_logit",
         "backend": backend,
+        "feature_variant": str(best["variant"]),
         "feature_set_name": cfg.feature_set_name,
         "valid_auc": float(valid_auc),
-        "n_meta_features": int(x_valid_meta.shape[1]),
+        "n_meta_features": n_meta_features,
         "n_valid": int(len(y_valid)),
         "cv_folds": int(cfg.level4_cv_folds),
-        "regularization_c": float(cfg.level4_regularization_c),
+        "regularization_c": (
+            None if best["regularization_c"] is None else float(best["regularization_c"])
+        ),
         "meta_feature_columns": meta_cols,
+        "candidate_scores": [
+            {
+                "variant": str(c["variant"]),
+                "backend": str(c["backend"]),
+                "regularization_c": (
+                    None if c["regularization_c"] is None else float(c["regularization_c"])
+                ),
+                "valid_auc": float(c["valid_auc"]),
+                "n_meta_features": int(c["n_meta_features"]),
+            }
+            for c in sorted(candidates, key=lambda d: float(d["valid_auc"]), reverse=True)
+        ],
     }
     (out_dir / "level4_final_metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
     return metrics
@@ -1927,6 +2862,17 @@ def _run_tree_level_stack(
     y_train = _as_binary_target(train_df[cfg.target_col], class_to_index=class_to_index)
     y_valid = _as_binary_target(valid_df[cfg.target_col], class_to_index=class_to_index)
     n_classes = len(class_labels) if class_labels else int(np.max(y_train)) + 1
+    train_sample_weight = None
+    sample_weight_by_class: dict[int, float] = {}
+    if cfg.use_balanced_sample_weight:
+        train_sample_weight, sample_weight_by_class = _compute_balanced_sample_weight(
+            y_train,
+            min_ratio=cfg.min_sample_weight_ratio,
+            max_ratio=cfg.max_sample_weight_ratio,
+        )
+        if sample_weight_by_class:
+            pretty = ", ".join(f"class_{k}={v:.3f}" for k, v in sorted(sample_weight_by_class.items()))
+            print(f"[TREE_SUITE] Using balanced sample weights: {pretty}")
 
     x_train, x_valid, x_test, _ = _encode_level_features(
         train_df=train_df,
@@ -1951,6 +2897,18 @@ def _run_tree_level_stack(
             seed=cfg.random_state + (100 * lib_idx),
             n_models=cfg.models_per_library,
         )
+        tuned_variants = _optuna_tuned_tree_variants(
+            cfg=cfg,
+            library_name=library_name,
+            seed=cfg.random_state + (100 * lib_idx),
+            x_train=x_train,
+            y_train=y_train,
+            x_valid=x_valid,
+            y_valid=y_valid,
+        )
+        if tuned_variants:
+            variants = variants + tuned_variants
+
         library_success_count = 0
         for model_idx, params in enumerate(variants, start=1):
             model_name = f"{library_name}_m{model_idx}"
@@ -1963,6 +2921,11 @@ def _run_tree_level_stack(
                     x_valid=x_valid,
                     x_test=x_test,
                     random_state=cfg.random_state + model_counter,
+                    sample_weight=train_sample_weight,
+                    raw_train_df=train_df,
+                    raw_valid_df=valid_df,
+                    raw_test_df=test_df,
+                    target_col=cfg.target_col,
                 )
             except Exception as exc:
                 print(f"[TREE_SUITE][WARN] {model_name} failed and will be skipped: {_short_exc(exc)}")
@@ -1990,7 +2953,7 @@ def _run_tree_level_stack(
                 level2_test_cols[pred_col] = test_pred[:, c].astype(np.float32)
             model_counter += 1
             library_success_count += 1
-            pred_tag = f"{model_name}_{cfg.feature_set_name}"
+            pred_tag = f"{model_name}_{_pred_run_tag(cfg)}"
             np.save(paths.oof_dir / f"oof_{pred_tag}.npy", valid_pred.astype(np.float32))
             np.save(paths.pred_dir / f"pred_{pred_tag}.npy", test_pred.astype(np.float32))
 
@@ -2040,6 +3003,35 @@ def _run_tree_level_stack(
             "Fix GPU backend availability for requested tree/deep libraries."
         )
 
+    level2_train_meta = level2_train
+    level2_valid_meta = level2_valid
+    level2_test_meta = level2_test
+    all_level2_pred_cols = sorted([c for c in level2_train.columns if c.startswith("l1_pred__")])
+    selected_meta_pred_cols, meta_filter_info = _select_level2_prediction_columns_for_meta(
+        cfg=cfg,
+        suite_metrics=suite_metrics,
+        level2_columns=list(level2_train.columns),
+    )
+    if all_level2_pred_cols and selected_meta_pred_cols and len(selected_meta_pred_cols) < len(all_level2_pred_cols):
+        selected_meta_pred_cols = [
+            c
+            for c in selected_meta_pred_cols
+            if c in level2_train.columns and c in level2_valid.columns and c in level2_test.columns
+        ]
+        base_cols = [c for c in level2_test.columns if not c.startswith("l1_pred__")]
+        keep_cols = base_cols + selected_meta_pred_cols
+        level2_train_meta = level2_train[keep_cols].copy()
+        level2_valid_meta = level2_valid[keep_cols].copy()
+        level2_test_meta = level2_test[keep_cols].copy()
+        meta_filter_info["selected_pred_columns"] = int(len(selected_meta_pred_cols))
+        print(
+            "[LEVEL3] Meta feature filter: "
+            f"kept {len(selected_meta_pred_cols)}/{len(all_level2_pred_cols)} Level-2 prediction columns "
+            f"from {meta_filter_info.get('selected_models', 0)}/{meta_filter_info.get('total_candidate_models', 0)} models."
+        )
+    elif all_level2_pred_cols:
+        print(f"[LEVEL3] Meta feature filter: using all {len(all_level2_pred_cols)} Level-2 prediction columns.")
+
     libraries_requested = list(active_libraries)
     libraries_requested.extend([f"dl_{family}" for family in active_deep_families])
     out_dir = paths.level2_results_dir / f"{cfg.level2_dataset_name}_{cfg.feature_set_name}"
@@ -2052,22 +3044,80 @@ def _run_tree_level_stack(
         level2_test=level2_test,
         suite_metrics=suite_metrics,
         libraries_requested=libraries_requested,
+        sample_weight_by_class=sample_weight_by_class,
     )
-    final_metrics = _train_level3_xgb(
-        cfg=cfg,
-        level2_train=level2_train,
-        level2_valid=level2_valid,
-        level2_test=level2_test,
-        y_train=y_train,
-        y_valid=y_valid,
-        out_dir=out_dir,
+    (out_dir / "meta_feature_filter.json").write_text(json.dumps(meta_filter_info, indent=2), encoding="utf-8")
+
+    level3_variants: list[tuple[str, pd.DataFrame, pd.DataFrame, pd.DataFrame]] = [
+        ("filtered", level2_train_meta, level2_valid_meta, level2_test_meta),
+    ]
+    has_filtered_variant = len(level2_train_meta.columns) < len(level2_train.columns)
+    if has_filtered_variant:
+        level3_variants.append(("all", level2_train, level2_valid, level2_test))
+
+    level3_runs: list[dict[str, object]] = []
+    for variant_name, l2_train_variant, l2_valid_variant, l2_test_variant in level3_variants:
+        metrics = _train_level3_xgb(
+            cfg=cfg,
+            level2_train=l2_train_variant,
+            level2_valid=l2_valid_variant,
+            level2_test=l2_test_variant,
+            y_train=y_train,
+            y_valid=y_valid,
+            out_dir=out_dir,
+            sample_weight=train_sample_weight,
+            sample_weight_by_class=sample_weight_by_class,
+        )
+        metrics = dict(metrics)
+        metrics["level2_feature_variant"] = variant_name
+        valid_pred = np.load(out_dir / "level3_valid_pred.npy").astype(np.float32)
+        test_pred = np.load(out_dir / "level3_test_pred.npy").astype(np.float32)
+        level3_runs.append(
+            {
+                "name": variant_name,
+                "metrics": metrics,
+                "valid_pred": valid_pred,
+                "test_pred": test_pred,
+                "level2_valid": l2_valid_variant,
+                "level2_test": l2_test_variant,
+            }
+        )
+        print(
+            f"[LEVEL3] Variant '{variant_name}' | valid_auc={float(metrics.get('valid_auc', 0.0)):.6f}"
+            f" | features={int(metrics.get('n_level2_features_used', 0))}"
+        )
+
+    best_level3_run = max(level3_runs, key=lambda r: float(r["metrics"]["valid_auc"]))
+    final_metrics = dict(best_level3_run["metrics"])
+    final_metrics["variant_search"] = [
+        {
+            "variant": str(r["name"]),
+            "valid_auc": float(r["metrics"]["valid_auc"]),
+            "n_level2_features_used": int(r["metrics"].get("n_level2_features_used", 0)),
+        }
+        for r in level3_runs
+    ]
+    final_metrics["selected_level2_feature_variant"] = str(best_level3_run["name"])
+    np.save(out_dir / "level3_valid_pred.npy", best_level3_run["valid_pred"].astype(np.float32))
+    np.save(out_dir / "level3_test_pred.npy", best_level3_run["test_pred"].astype(np.float32))
+    valid_pred_arr = _ensure_proba_2d(
+        np.asarray(best_level3_run["valid_pred"]),
+        n_classes=int(np.max(y_valid)) + 1,
     )
+    valid_df = pd.DataFrame({"y_true": y_valid.astype(np.int32)})
+    for c in range(valid_pred_arr.shape[1]):
+        valid_df[f"y_pred_c{c}"] = valid_pred_arr[:, c].astype(np.float32)
+    _save_parquet(valid_df, out_dir / "level3_valid_predictions.parquet")
+    (out_dir / "level3_final_metrics.json").write_text(json.dumps(final_metrics, indent=2), encoding="utf-8")
+
+    level2_valid_for_level4 = best_level3_run["level2_valid"]
+    level2_test_for_level4 = best_level3_run["level2_test"]
     level4_metrics = None
     if cfg.run_level4_stack:
         level4_metrics = _train_level4_logit_stack(
             cfg=cfg,
-            level2_valid=level2_valid,
-            level2_test=level2_test,
+            level2_valid=level2_valid_for_level4,
+            level2_test=level2_test_for_level4,
             y_valid=y_valid,
             out_dir=out_dir,
             paths=paths,
@@ -2536,6 +3586,56 @@ def _resolve_stacking_min_models(paths, default: int = 8) -> int:
         return max(8, int(default))
 
 
+def _resolve_class_weight_calibration_enabled(paths, default: bool = True) -> bool:
+    tree_metric_files = sorted(paths.level2_results_dir.glob("*/tree_suite_metrics.json"), key=lambda p: p.stat().st_mtime)
+    if not tree_metric_files:
+        return bool(default)
+    latest = tree_metric_files[-1]
+    try:
+        payload = json.loads(latest.read_text(encoding="utf-8"))
+    except Exception:
+        return bool(default)
+    value = payload.get("enable_class_weight_calibration")
+    if value is None:
+        return bool(default)
+    return bool(value)
+
+
+def _resolve_class_weight_calibration_grid(
+    paths,
+    default: tuple[float, ...] = (0.60, 0.70, 0.80, 0.90, 1.00, 1.10, 1.20, 1.40, 1.60, 1.80, 2.00),
+) -> tuple[float, ...]:
+    tree_metric_files = sorted(paths.level2_results_dir.glob("*/tree_suite_metrics.json"), key=lambda p: p.stat().st_mtime)
+    if not tree_metric_files:
+        return tuple(float(v) for v in default)
+    latest = tree_metric_files[-1]
+    try:
+        payload = json.loads(latest.read_text(encoding="utf-8"))
+    except Exception:
+        return tuple(float(v) for v in default)
+    value = payload.get("class_weight_calibration_grid")
+    if not isinstance(value, list) or not value:
+        return tuple(float(v) for v in default)
+    out = tuple(float(v) for v in value if float(v) > 0.0)
+    return out if out else tuple(float(v) for v in default)
+
+
+def _resolve_class_weight_calibration_trials(paths, default: int = 120) -> int:
+    tree_metric_files = sorted(paths.level2_results_dir.glob("*/tree_suite_metrics.json"), key=lambda p: p.stat().st_mtime)
+    if not tree_metric_files:
+        return int(default)
+    latest = tree_metric_files[-1]
+    try:
+        payload = json.loads(latest.read_text(encoding="utf-8"))
+    except Exception:
+        return int(default)
+    value = payload.get("class_weight_calibration_random_trials")
+    try:
+        return max(0, int(value))
+    except Exception:
+        return max(0, int(default))
+
+
 def _collect_oof_candidates(paths, y_valid: np.ndarray, min_auc: float = 0.0) -> list[dict[str, object]]:
     candidates: list[dict[str, object]] = []
     for oof_path in sorted(paths.oof_dir.glob("oof_*.npy")):
@@ -2637,48 +3737,76 @@ def _hill_climb() -> None:
         print(f"[HILL_CLIMB] No compatible OOF predictions found at min_auc={min_auc:.3f}.")
         return
 
+    candidates = [c for c in candidates if c.get("pred") is not None]
+    if not candidates:
+        print("[HILL_CLIMB] No candidates have both OOF and test predictions.")
+        return
+
     candidates = sorted(candidates, key=lambda x: float(x["individual_auc"]), reverse=True)
     candidates = candidates[: min(300, len(candidates))]
-    selected_names: list[str] = []
+    selected_names: list[str] = [str(candidates[0]["name"])]
+    selected_weights: list[float] = [1.0]
     selected_set: set[str] = set()
+    selected_set.add(selected_names[0])
     progression: list[dict[str, object]] = []
-    ensemble = np.zeros_like(candidates[0]["oof"], dtype=np.float32)
-    current_auc = 0.0
+    ensemble = np.asarray(candidates[0]["oof"], dtype=np.float32).copy()
+    ensemble_test = np.asarray(candidates[0]["pred"], dtype=np.float32).copy()
+    current_auc = float(_score_predictions(y_valid, ensemble))
+    progression.append(
+        {
+            "step": 1,
+            "added_model": selected_names[0],
+            "blend_alpha_prev": 0.0,
+            "blend_alpha_new": 1.0,
+            "ensemble_valid_auc": float(current_auc),
+        }
+    )
+    alpha_grid = [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 0.95]
 
-    for step in range(min(150, len(candidates))):
+    for step in range(2, min(150, len(candidates)) + 1):
         best_name = None
+        best_alpha_prev = None
         best_auc = current_auc
         best_pred = None
-        denom = max(1, len(selected_names))
+        best_test_pred = None
 
         for cand in candidates:
             name = str(cand["name"])
             if name in selected_set:
                 continue
-            cand_oof = cand["oof"]
-            if not selected_names:
-                trial = cand_oof.astype(np.float32)
-            else:
-                trial = ((ensemble * denom) + cand_oof) / float(denom + 1)
-            auc = float(_score_predictions(y_valid, trial))
-            if best_name is None or auc > best_auc:
-                best_name = name
-                best_auc = auc
-                best_pred = trial
+
+            cand_oof = np.asarray(cand["oof"], dtype=np.float32)
+            cand_test = np.asarray(cand["pred"], dtype=np.float32)
+            for alpha_prev in alpha_grid:
+                alpha_new = 1.0 - float(alpha_prev)
+                trial = (float(alpha_prev) * ensemble) + (alpha_new * cand_oof)
+                auc = float(_score_predictions(y_valid, trial))
+                if best_name is None or auc > best_auc + 1e-12:
+                    best_name = name
+                    best_alpha_prev = float(alpha_prev)
+                    best_auc = auc
+                    best_pred = trial.astype(np.float32)
+                    best_test_pred = ((float(alpha_prev) * ensemble_test) + (alpha_new * cand_test)).astype(np.float32)
 
         if best_name is None:
             break
-        if selected_names and best_auc <= current_auc + 1e-6:
+        if best_auc <= current_auc + 1e-6:
             break
 
+        for idx in range(len(selected_weights)):
+            selected_weights[idx] *= float(best_alpha_prev)
+        selected_weights.append(1.0 - float(best_alpha_prev))
         selected_names.append(best_name)
         selected_set.add(best_name)
         ensemble = best_pred.astype(np.float32)
+        ensemble_test = best_test_pred.astype(np.float32)
         current_auc = best_auc
         progression.append(
             {
-                "step": int(step + 1),
+                "step": int(step),
                 "added_model": best_name,
+                "blend_alpha_prev": float(best_alpha_prev),
+                "blend_alpha_new": float(1.0 - float(best_alpha_prev)),
                 "ensemble_valid_auc": float(current_auc),
             }
         )
@@ -2686,19 +3814,13 @@ def _hill_climb() -> None:
     out_dir = paths.level2_results_dir / "hill_climb"
     out_dir.mkdir(parents=True, exist_ok=True)
     np.save(out_dir / "hill_climb_valid_pred.npy", ensemble.astype(np.float32))
-
-    selected_test_preds = []
-    for name in selected_names:
-        cand = next((c for c in candidates if c["name"] == name), None)
-        if cand is not None and cand["pred"] is not None:
-            selected_test_preds.append(cand["pred"])
-    if selected_test_preds:
-        np.save(out_dir / "hill_climb_test_pred.npy", np.mean(np.stack(selected_test_preds, axis=0), axis=0).astype(np.float32))
+    np.save(out_dir / "hill_climb_test_pred.npy", ensemble_test.astype(np.float32))
 
     result = {
         "target_col": target_col,
         "candidates_considered": int(len(candidates)),
         "models_selected": selected_names,
+        "model_weights": [float(w) for w in selected_weights],
         "stacking_seed_models": [str(c["name"]) for c in candidates[: max(min_models, 16)]],
         "final_valid_auc": float(current_auc),
         "progression": progression,
@@ -2709,6 +3831,285 @@ def _hill_climb() -> None:
     (out_dir / "hill_climb_selection.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
     print(f"[HILL_CLIMB] Selected {len(selected_names)} models | valid_auc={current_auc:.6f}")
     print(f"[HILL_CLIMB] Saved artifacts in: {out_dir}")
+
+
+def _as_proba_matrix(arr: np.ndarray, n_classes: int) -> np.ndarray:
+    out = _ensure_proba_2d(np.asarray(arr), n_classes=n_classes).astype(np.float32)
+    return out
+
+
+def _power_normalize_proba(pred: np.ndarray, power: float) -> np.ndarray:
+    p = np.asarray(pred, dtype=np.float32)
+    if abs(float(power) - 1.0) <= 1e-8:
+        return p.astype(np.float32)
+    p = np.clip(p, 1e-9, 1.0)
+    p = np.power(p, float(power)).astype(np.float32)
+    p = p / np.clip(p.sum(axis=1, keepdims=True), 1e-9, None)
+    return p.astype(np.float32)
+
+
+def _safe_feature_name(name: str, idx: int) -> str:
+    raw = "".join(ch if ch.isalnum() else "_" for ch in str(name))
+    raw = "_".join([part for part in raw.split("_") if part])
+    return f"m{idx}_{raw[:80]}"
+
+
+def _build_stacking_meta_features(
+    selected: list[dict[str, object]],
+    n_classes: int,
+) -> tuple[np.ndarray, np.ndarray, list[str]]:
+    valid_parts: list[np.ndarray] = []
+    test_parts: list[np.ndarray] = []
+    names: list[str] = []
+    valid_stack: list[np.ndarray] = []
+    test_stack: list[np.ndarray] = []
+
+    for idx, cand in enumerate(selected):
+        base = _safe_feature_name(str(cand["name"]), idx)
+        oof = _as_proba_matrix(np.asarray(cand["oof"]), n_classes=n_classes)
+        pred = _as_proba_matrix(np.asarray(cand["pred"]), n_classes=n_classes)
+        valid_stack.append(oof)
+        test_stack.append(pred)
+
+        for c in range(n_classes):
+            valid_parts.append(oof[:, c])
+            test_parts.append(pred[:, c])
+            names.append(f"{base}__proba_c{c}")
+
+        oof_sorted = np.sort(oof, axis=1)
+        pred_sorted = np.sort(pred, axis=1)
+        oof_top = oof_sorted[:, -1]
+        pred_top = pred_sorted[:, -1]
+        if n_classes > 1:
+            oof_margin = oof_sorted[:, -1] - oof_sorted[:, -2]
+            pred_margin = pred_sorted[:, -1] - pred_sorted[:, -2]
+        else:
+            oof_margin = oof_top
+            pred_margin = pred_top
+        oof_entropy = -(oof * np.log(np.clip(oof, 1e-9, 1.0))).sum(axis=1)
+        pred_entropy = -(pred * np.log(np.clip(pred, 1e-9, 1.0))).sum(axis=1)
+
+        valid_parts.extend([oof_top, oof_margin.astype(np.float32), oof_entropy.astype(np.float32)])
+        test_parts.extend([pred_top, pred_margin.astype(np.float32), pred_entropy.astype(np.float32)])
+        names.extend([f"{base}__top1", f"{base}__margin", f"{base}__entropy"])
+
+    if not valid_stack:
+        raise ValueError("No models available for stacking meta features.")
+
+    stack_valid = np.stack(valid_stack, axis=0).astype(np.float32)
+    stack_test = np.stack(test_stack, axis=0).astype(np.float32)
+    mean_valid = stack_valid.mean(axis=0)
+    mean_test = stack_test.mean(axis=0)
+    std_valid = stack_valid.std(axis=0)
+    std_test = stack_test.std(axis=0)
+
+    for c in range(n_classes):
+        valid_parts.extend([mean_valid[:, c], std_valid[:, c]])
+        test_parts.extend([mean_test[:, c], std_test[:, c]])
+        names.extend([f"ens__mean_c{c}", f"ens__std_c{c}"])
+
+    mean_sorted_valid = np.sort(mean_valid, axis=1)
+    mean_sorted_test = np.sort(mean_test, axis=1)
+    mean_top_valid = mean_sorted_valid[:, -1]
+    mean_top_test = mean_sorted_test[:, -1]
+    if n_classes > 1:
+        mean_margin_valid = mean_sorted_valid[:, -1] - mean_sorted_valid[:, -2]
+        mean_margin_test = mean_sorted_test[:, -1] - mean_sorted_test[:, -2]
+    else:
+        mean_margin_valid = mean_top_valid
+        mean_margin_test = mean_top_test
+    mean_entropy_valid = -(mean_valid * np.log(np.clip(mean_valid, 1e-9, 1.0))).sum(axis=1)
+    mean_entropy_test = -(mean_test * np.log(np.clip(mean_test, 1e-9, 1.0))).sum(axis=1)
+    std_sum_valid = std_valid.sum(axis=1)
+    std_sum_test = std_test.sum(axis=1)
+
+    valid_parts.extend(
+        [
+            mean_top_valid.astype(np.float32),
+            mean_margin_valid.astype(np.float32),
+            mean_entropy_valid.astype(np.float32),
+            std_sum_valid.astype(np.float32),
+        ]
+    )
+    test_parts.extend(
+        [
+            mean_top_test.astype(np.float32),
+            mean_margin_test.astype(np.float32),
+            mean_entropy_test.astype(np.float32),
+            std_sum_test.astype(np.float32),
+        ]
+    )
+    names.extend(["ens__top1", "ens__margin", "ens__entropy", "ens__stdsum"])
+
+    x_valid = np.column_stack(valid_parts).astype(np.float32)
+    x_test = np.column_stack(test_parts).astype(np.float32)
+    return x_valid, x_test, names
+
+
+def _resolve_id_col(paths) -> str:
+    split_summary_path = paths.processed_data / "split_summary.json"
+    if split_summary_path.exists():
+        try:
+            payload = json.loads(split_summary_path.read_text(encoding="utf-8"))
+            return str(payload.get("id_col", "id"))
+        except Exception:
+            return "id"
+    return "id"
+
+
+def _write_submission_from_proba(
+    *,
+    paths,
+    pred: np.ndarray,
+    class_labels: list[str],
+    target_col: str,
+    filename: str,
+) -> Path:
+    test_path = paths.processed_data / "test.parquet"
+    if not test_path.exists():
+        raise FileNotFoundError("Missing processed test split for submission writing.")
+    test_df = pd.read_parquet(test_path)
+    id_col = _resolve_id_col(paths)
+    pred_labels = _proba_to_labels(pred, class_labels)
+    if id_col in test_df.columns:
+        submission_id = test_df[id_col].to_numpy()
+    else:
+        submission_id = np.arange(len(test_df), dtype=np.int64)
+    submission = pd.DataFrame({id_col: submission_id, target_col: pred_labels})
+    submissions_dir = paths.outputs_root / "submissions"
+    submissions_dir.mkdir(parents=True, exist_ok=True)
+    submission_path = submissions_dir / filename
+    submission.to_csv(submission_path, index=False)
+    return submission_path
+
+
+def _weight_grid(n_candidates: int, step: float) -> list[np.ndarray]:
+    step_units = max(1, int(round(1.0 / max(1e-6, step))))
+    grids: list[np.ndarray] = []
+    if n_candidates == 1:
+        return [np.array([1.0], dtype=np.float32)]
+    if n_candidates == 2:
+        for a in range(step_units + 1):
+            b = step_units - a
+            grids.append(np.array([a / step_units, b / step_units], dtype=np.float32))
+        return grids
+    if n_candidates == 3:
+        for a in range(step_units + 1):
+            for b in range(step_units - a + 1):
+                c = step_units - a - b
+                grids.append(np.array([a / step_units, b / step_units, c / step_units], dtype=np.float32))
+        return grids
+    raise ValueError("Weight grid supports 1 to 3 candidates.")
+
+
+def _hard_vote_proba_from_stack(stack: np.ndarray) -> np.ndarray:
+    arr = np.asarray(stack, dtype=np.float32)
+    if arr.ndim != 3:
+        raise ValueError(f"Expected shape (n_models, n_rows, n_classes), got {arr.shape}")
+    n_models, n_rows, n_classes = arr.shape
+    if n_models <= 0 or n_rows <= 0 or n_classes <= 1:
+        raise ValueError(f"Invalid stack shape: {arr.shape}")
+
+    labels = np.argmax(arr, axis=2).astype(np.int32)  # (n_models, n_rows)
+    counts = np.zeros((n_rows, n_classes), dtype=np.int32)
+    for cls in range(n_classes):
+        counts[:, cls] = np.sum(labels == cls, axis=0, dtype=np.int32)
+
+    winners = np.argmax(counts, axis=1).astype(np.int32)
+    max_counts = counts[np.arange(n_rows), winners]
+    tie_mask = np.sum(counts == max_counts.reshape(-1, 1), axis=1) > 1
+    if np.any(tie_mask):
+        # Tie-break using mean probability to avoid arbitrary class ordering effects.
+        mean_proba = np.mean(arr, axis=0)
+        winners[tie_mask] = np.argmax(mean_proba[tie_mask], axis=1).astype(np.int32)
+
+    out = np.zeros((n_rows, n_classes), dtype=np.float32)
+    out[np.arange(n_rows), winners] = 1.0
+    return out
+
+
+def _collect_historical_final_blend_candidates(
+    *,
+    paths,
+    y_valid: np.ndarray,
+    n_classes: int,
+    max_items: int = 8,
+) -> list[dict[str, object]]:
+    history_root = paths.level2_results_dir / "history"
+    if not history_root.exists():
+        return []
+
+    candidates: list[dict[str, object]] = []
+    run_dirs = sorted(
+        [p for p in history_root.glob("final_blend_*") if p.is_dir()],
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    for run_dir in run_dirs:
+        valid_path = run_dir / "final_blend_valid_pred.npy"
+        test_path = run_dir / "final_blend_test_pred.npy"
+        if not valid_path.exists() or not test_path.exists():
+            continue
+        try:
+            oof = _as_proba_matrix(np.load(valid_path), n_classes=n_classes)
+            pred = _as_proba_matrix(np.load(test_path), n_classes=n_classes)
+        except Exception:
+            continue
+        if oof.shape[0] != y_valid.shape[0]:
+            continue
+        if not np.all(np.isfinite(oof)) or not np.all(np.isfinite(pred)):
+            continue
+        try:
+            auc = float(_score_predictions(y_valid, oof))
+        except Exception:
+            continue
+        candidates.append(
+            {
+                "name": f"history::{run_dir.name}",
+                "oof": oof.astype(np.float32),
+                "pred": pred.astype(np.float32),
+                "individual_auc": auc,
+            }
+        )
+        if len(candidates) >= int(max_items):
+            break
+    return candidates
+
+
+def _archive_final_blend_artifacts(
+    *,
+    paths,
+    valid_pred: np.ndarray,
+    test_pred: np.ndarray,
+    summary: dict[str, object],
+    max_keep: int = 24,
+) -> None:
+    history_root = paths.level2_results_dir / "history"
+    history_root.mkdir(parents=True, exist_ok=True)
+    score = float(summary.get("best_valid_auc", 0.0))
+    score_tag = f"{score:.6f}".replace(".", "p")
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = history_root / f"final_blend_{stamp}_{score_tag}"
+    suffix = 1
+    while run_dir.exists():
+        run_dir = history_root / f"final_blend_{stamp}_{score_tag}_{suffix:02d}"
+        suffix += 1
+
+    run_dir.mkdir(parents=True, exist_ok=False)
+    np.save(run_dir / "final_blend_valid_pred.npy", np.asarray(valid_pred, dtype=np.float32))
+    np.save(run_dir / "final_blend_test_pred.npy", np.asarray(test_pred, dtype=np.float32))
+    (run_dir / "final_blend_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+    run_dirs = sorted(
+        [p for p in history_root.glob("final_blend_*") if p.is_dir()],
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    for stale in run_dirs[int(max_keep) :]:
+        try:
+            shutil.rmtree(stale, ignore_errors=True)
+        except Exception:
+            continue
 
 
 def _stacking() -> None:
@@ -2754,15 +4155,13 @@ def _stacking() -> None:
         print("[STACKING] Need at least 2 models with OOF and test predictions.")
         return
 
-    def _flat(arr: np.ndarray) -> np.ndarray:
-        a = np.asarray(arr, dtype=np.float32)
-        if a.ndim == 1:
-            return a.reshape(-1, 1)
-        return a.reshape(a.shape[0], -1)
+    n_classes = int(np.max(y_valid)) + 1
+    x_valid, x_test, meta_feature_columns = _build_stacking_meta_features(selected, n_classes=n_classes)
 
-    x_valid = np.concatenate([_flat(c["oof"]) for c in selected], axis=1).astype(np.float32)
-    x_test = np.concatenate([_flat(c["pred"]) for c in selected], axis=1).astype(np.float32)
-    oof_pred, test_pred, backend = _fit_level4_logistic_cv(
+    scores: dict[str, float] = {}
+    preds: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+
+    oof_logit, test_logit, _ = _fit_level4_logistic_cv(
         x_valid=x_valid,
         y_valid=y_valid,
         x_test=x_test,
@@ -2770,7 +4169,68 @@ def _stacking() -> None:
         random_state=42,
         c_value=1.0,
     )
-    valid_auc = float(_score_predictions(y_valid, oof_pred))
+    logit_score = float(_score_predictions(y_valid, oof_logit))
+    scores["sklearn_logistic_cv"] = logit_score
+    preds["sklearn_logistic_cv"] = (oof_logit, test_logit)
+
+    if XGBClassifier is not None and cp is not None:
+        try:
+            oof_xgb, test_xgb, _ = _fit_level4_xgb_meta_cv(
+                x_valid=x_valid,
+                y_valid=y_valid,
+                x_test=x_test,
+                n_splits=5,
+                random_state=42,
+            )
+            xgb_score = float(_score_predictions(y_valid, oof_xgb))
+            scores["xgboost_gpu_meta_cv"] = xgb_score
+            preds["xgboost_gpu_meta_cv"] = (oof_xgb, test_xgb)
+        except Exception as exc:
+            print(f"[STACKING][WARN] XGBoost meta-CV unavailable, using logistic only: {_short_exc(exc)}")
+
+    if CatBoostClassifier is not None:
+        try:
+            oof_cat, test_cat, _ = _fit_level4_catboost_meta_cv(
+                x_valid=x_valid,
+                y_valid=y_valid,
+                x_test=x_test,
+                n_splits=5,
+                random_state=43,
+            )
+            cat_score = float(_score_predictions(y_valid, oof_cat))
+            scores["catboost_gpu_meta_cv"] = cat_score
+            preds["catboost_gpu_meta_cv"] = (oof_cat, test_cat)
+        except Exception as exc:
+            print(f"[STACKING][WARN] CatBoost meta-CV unavailable, skipping: {_short_exc(exc)}")
+
+    backend = max(scores, key=scores.get)
+    oof_pred, test_pred = preds[backend]
+    valid_auc = float(scores[backend])
+    calibration = {
+        "enabled": False,
+        "applied": False,
+        "base_valid_auc": float(valid_auc),
+    }
+    if n_classes > 2 and _resolve_class_weight_calibration_enabled(paths, default=True):
+        grid = _resolve_class_weight_calibration_grid(paths)
+        random_trials = _resolve_class_weight_calibration_trials(paths, default=120)
+        calibration["enabled"] = True
+        cal_oof, cal_weights, cal_score, n_evaluated = _optimize_class_probability_weights(
+            y_true=y_valid,
+            pred=oof_pred,
+            grid_values=grid,
+            random_trials=random_trials,
+            random_state=42,
+        )
+        calibration["weights"] = [float(v) for v in cal_weights.tolist()]
+        calibration["n_weight_candidates_evaluated"] = int(n_evaluated)
+        calibration["calibrated_valid_auc"] = float(cal_score)
+        if cal_score > valid_auc + 1e-8:
+            oof_pred = cal_oof
+            test_pred = _apply_class_probability_weights(test_pred, cal_weights)
+            valid_auc = float(cal_score)
+            backend = f"{backend}+class_weight_calibration"
+            calibration["applied"] = True
 
     out_dir = paths.level2_results_dir / "stacking"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -2785,14 +4245,420 @@ def _stacking() -> None:
     _save_parquet(stacked_df, out_dir / "stacked_valid_predictions.parquet")
     metrics = {
         "backend": backend,
+        "candidate_backend_scores": {k: float(v) for k, v in scores.items()},
         "target_col": target_col,
         "n_models": int(len(selected)),
         "selected_models": [str(c["name"]) for c in selected],
+        "n_meta_features": int(x_valid.shape[1]),
+        "meta_feature_columns": meta_feature_columns,
         "valid_auc": valid_auc,
+        "class_weight_calibration": calibration,
     }
     (out_dir / "stacking_metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
     print(f"[STACKING] valid_auc={valid_auc:.6f} | models={len(selected)}")
     print(f"[STACKING] Saved artifacts in: {out_dir}")
+
+
+def _final_blend() -> None:
+    paths = get_paths()
+    valid_path = paths.processed_data / "valid.parquet"
+    if not valid_path.exists():
+        print("[FINAL_BLEND] Missing valid split. Run prepare_data first.")
+        return
+
+    valid_df = pd.read_parquet(valid_path)
+    target_col = _infer_target_column(valid_df)
+    class_labels, class_to_index = _load_target_mapping(paths)
+    y_valid = _as_binary_target(valid_df[target_col], class_to_index=class_to_index or None)
+    n_classes = int(np.max(y_valid)) + 1
+
+    candidates = _collect_oof_candidates(paths, y_valid, min_auc=0.0)
+    if not candidates:
+        print("[FINAL_BLEND] No OOF candidates found.")
+        return
+    for cand in candidates:
+        cand["oof"] = _as_proba_matrix(np.asarray(cand["oof"]), n_classes=n_classes)
+        if cand["pred"] is not None:
+            cand["pred"] = _as_proba_matrix(np.asarray(cand["pred"]), n_classes=n_classes)
+
+    candidates = [c for c in candidates if c.get("pred") is not None]
+    if not candidates:
+        print("[FINAL_BLEND] No candidates have both OOF and test predictions.")
+        return
+    candidates = sorted(candidates, key=lambda x: float(x["individual_auc"]), reverse=True)
+    best_single = candidates[0]
+    top_single_pool = max(12, min(36, len(candidates)))
+    pool: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for cand in candidates[:top_single_pool]:
+        name = str(cand["name"])
+        if name in seen:
+            continue
+        pool.append(cand)
+        seen.add(name)
+
+    hc_valid = paths.level2_results_dir / "hill_climb" / "hill_climb_valid_pred.npy"
+    hc_test = paths.level2_results_dir / "hill_climb" / "hill_climb_test_pred.npy"
+    if hc_valid.exists() and hc_test.exists():
+        try:
+            oof = _as_proba_matrix(np.load(hc_valid), n_classes=n_classes)
+            pred = _as_proba_matrix(np.load(hc_test), n_classes=n_classes)
+            if oof.shape[0] == y_valid.shape[0]:
+                auc = float(_score_predictions(y_valid, oof))
+                name = "hill_climb"
+                if name not in seen:
+                    pool.append({"name": name, "oof": oof, "pred": pred, "individual_auc": auc})
+                    seen.add(name)
+        except Exception:
+            pass
+
+    stack_valid = paths.level2_results_dir / "stacking" / "stacked_valid_pred.npy"
+    stack_test = paths.level2_results_dir / "stacking" / "stacked_test_pred.npy"
+    if stack_valid.exists() and stack_test.exists():
+        try:
+            oof = _as_proba_matrix(np.load(stack_valid), n_classes=n_classes)
+            pred = _as_proba_matrix(np.load(stack_test), n_classes=n_classes)
+            if oof.shape[0] == y_valid.shape[0]:
+                auc = float(_score_predictions(y_valid, oof))
+                name = "stacking"
+                if name not in seen:
+                    pool.append({"name": name, "oof": oof, "pred": pred, "individual_auc": auc})
+                    seen.add(name)
+        except Exception:
+            pass
+
+    prev_final_valid = paths.level2_results_dir / "final_blend" / "final_blend_valid_pred.npy"
+    prev_final_test = paths.level2_results_dir / "final_blend" / "final_blend_test_pred.npy"
+    if prev_final_valid.exists() and prev_final_test.exists():
+        try:
+            oof = _as_proba_matrix(np.load(prev_final_valid), n_classes=n_classes)
+            pred = _as_proba_matrix(np.load(prev_final_test), n_classes=n_classes)
+            if oof.shape[0] == y_valid.shape[0]:
+                auc = float(_score_predictions(y_valid, oof))
+                name = "previous_final_blend"
+                if name not in seen:
+                    pool.append({"name": name, "oof": oof, "pred": pred, "individual_auc": auc})
+                    seen.add(name)
+        except Exception:
+            pass
+
+    for hist in _collect_historical_final_blend_candidates(
+        paths=paths,
+        y_valid=y_valid,
+        n_classes=n_classes,
+        max_items=10,
+    ):
+        name = str(hist["name"])
+        if name in seen:
+            continue
+        pool.append(hist)
+        seen.add(name)
+
+    # Add synthetic ensemble candidates from top-N models for diversity in the final search pool.
+    for n in (3, 5, 8, 12, 16, 24):
+        if len(candidates) < n:
+            continue
+        top_n = candidates[:n]
+        top_oof = np.stack([np.asarray(c["oof"], dtype=np.float32) for c in top_n], axis=0)
+        top_pred = np.stack([np.asarray(c["pred"], dtype=np.float32) for c in top_n], axis=0)
+
+        mean_name = f"top{n}_mean"
+        if mean_name not in seen:
+            mean_oof = np.mean(top_oof, axis=0).astype(np.float32)
+            mean_pred = np.mean(top_pred, axis=0).astype(np.float32)
+            mean_auc = float(_score_predictions(y_valid, mean_oof))
+            pool.append({"name": mean_name, "oof": mean_oof, "pred": mean_pred, "individual_auc": mean_auc})
+            seen.add(mean_name)
+
+        geo_name = f"top{n}_geo"
+        if geo_name not in seen:
+            geo_oof = np.exp(np.mean(np.log(np.clip(top_oof, 1e-9, 1.0)), axis=0)).astype(np.float32)
+            geo_oof = geo_oof / np.clip(geo_oof.sum(axis=1, keepdims=True), 1e-9, None)
+            geo_pred = np.exp(np.mean(np.log(np.clip(top_pred, 1e-9, 1.0)), axis=0)).astype(np.float32)
+            geo_pred = geo_pred / np.clip(geo_pred.sum(axis=1, keepdims=True), 1e-9, None)
+            geo_auc = float(_score_predictions(y_valid, geo_oof))
+            pool.append({"name": geo_name, "oof": geo_oof, "pred": geo_pred, "individual_auc": geo_auc})
+            seen.add(geo_name)
+
+        vote_name = f"top{n}_vote"
+        if vote_name not in seen:
+            vote_oof = _hard_vote_proba_from_stack(top_oof)
+            vote_pred = _hard_vote_proba_from_stack(top_pred)
+            vote_auc = float(_score_predictions(y_valid, vote_oof))
+            pool.append({"name": vote_name, "oof": vote_oof, "pred": vote_pred, "individual_auc": vote_auc})
+            seen.add(vote_name)
+
+    pool = sorted(pool, key=lambda x: float(x["individual_auc"]), reverse=True)
+    if not pool:
+        print("[FINAL_BLEND] No blendable candidates found.")
+        return
+
+    best_score = -1.0
+    best_weights: np.ndarray | None = None
+    best_combo: tuple[int, ...] | None = None
+    best_oof: np.ndarray | None = None
+    best_test: np.ndarray | None = None
+    step = 0.025
+    coarse_pool = pool[: min(8, len(pool))]
+    random_pool = pool[: min(64, len(pool))]
+    random_trials = 5000
+    random_meta = {
+        "enabled": len(random_pool) >= 2,
+        "trials": int(random_trials),
+        "best_trial": None,
+        "best_mode": None,
+        "best_strategy": None,
+    }
+
+    for r in [1, 2, 3]:
+        if len(coarse_pool) < r:
+            continue
+        for combo in itertools.combinations(range(len(coarse_pool)), r):
+            grids = _weight_grid(r, step=step)
+            oof_stack = [coarse_pool[i]["oof"] for i in combo]
+            test_stack = [coarse_pool[i]["pred"] for i in combo]
+            for weights in grids:
+                blend_oof = np.zeros_like(oof_stack[0], dtype=np.float32)
+                blend_test = np.zeros_like(test_stack[0], dtype=np.float32)
+                for w, o, t in zip(weights, oof_stack, test_stack):
+                    blend_oof += float(w) * np.asarray(o, dtype=np.float32)
+                    blend_test += float(w) * np.asarray(t, dtype=np.float32)
+                score = float(_score_predictions(y_valid, blend_oof))
+                if score > best_score:
+                    best_score = score
+                    best_weights = weights.copy()
+                    best_combo = combo
+                    best_oof = blend_oof
+                    best_test = blend_test
+
+    if len(random_pool) >= 2:
+        rng = np.random.default_rng(2026)
+        oof_tensor = np.stack([np.asarray(c["oof"], dtype=np.float32) for c in random_pool], axis=0)
+        test_tensor = np.stack([np.asarray(c["pred"], dtype=np.float32) for c in random_pool], axis=0)
+        rank = np.arange(len(random_pool), dtype=np.float32)
+        random_meta["pool_size"] = int(len(random_pool))
+
+        strategy_specs = [
+            {
+                "name": "focused",
+                "trials": int(random_trials * 0.45),
+                "decay": 0.35,
+                "min_k": 2,
+                "max_k": min(12, len(random_pool)),
+                "concentrations": np.array([0.25, 0.5, 0.8, 1.2], dtype=np.float32),
+                "power_low": 0.85,
+                "power_high": 1.35,
+                "geo_prob": 0.55,
+            },
+            {
+                "name": "broad",
+                "trials": int(random_trials * 0.35),
+                "decay": 0.16,
+                "min_k": 3,
+                "max_k": min(20, len(random_pool)),
+                "concentrations": np.array([0.20, 0.35, 0.5, 0.8, 1.2], dtype=np.float32),
+                "power_low": 0.80,
+                "power_high": 1.80,
+                "geo_prob": 0.40,
+            },
+            {
+                "name": "dense",
+                "trials": random_trials - int(random_trials * 0.45) - int(random_trials * 0.35),
+                "decay": 0.10,
+                "min_k": 6,
+                "max_k": min(24, len(random_pool)),
+                "concentrations": np.array([0.15, 0.25, 0.4, 0.6, 0.9, 1.2], dtype=np.float32),
+                "power_low": 0.95,
+                "power_high": 2.60,
+                "geo_prob": 0.25,
+            },
+        ]
+
+        global_trial_idx = 0
+        for spec in strategy_specs:
+            min_k = int(spec["min_k"])
+            max_k = int(spec["max_k"])
+            n_trials = int(spec["trials"])
+            if n_trials <= 0 or max_k < min_k or max_k < 2:
+                continue
+            pick_prob = np.exp(-float(spec["decay"]) * rank)
+            pick_prob = pick_prob / np.clip(pick_prob.sum(), 1e-9, None)
+
+            for _ in range(n_trials):
+                k = int(rng.integers(min_k, max_k + 1))
+                idx = np.sort(rng.choice(len(random_pool), size=k, replace=False, p=pick_prob)).astype(np.int32)
+                concentration = float(rng.choice(spec["concentrations"]))
+                alpha = np.full(k, concentration, dtype=np.float32)
+                weights = rng.dirichlet(alpha).astype(np.float32)
+                power = float(rng.uniform(float(spec["power_low"]), float(spec["power_high"])))
+                weights = np.power(weights, power).astype(np.float32)
+                weights = (weights / np.clip(np.sum(weights), 1e-9, None)).astype(np.float32)
+
+                blend_oof = np.tensordot(weights, oof_tensor[idx], axes=(0, 0)).astype(np.float32)
+                blend_test = np.tensordot(weights, test_tensor[idx], axes=(0, 0)).astype(np.float32)
+                score = float(_score_predictions(y_valid, blend_oof))
+                if score > best_score:
+                    best_score = score
+                    best_weights = weights.copy()
+                    best_combo = tuple(int(i) for i in idx.tolist())
+                    best_oof = blend_oof
+                    best_test = blend_test
+                    random_meta["best_trial"] = int(global_trial_idx)
+                    random_meta["best_mode"] = "linear"
+                    random_meta["best_strategy"] = str(spec["name"])
+
+                # Geometric mean in probability simplex often improves robustness for class imbalance.
+                if float(spec["geo_prob"]) > 0.0 and float(rng.random()) <= float(spec["geo_prob"]):
+                    log_oof = np.exp(
+                        np.tensordot(weights, np.log(np.clip(oof_tensor[idx], 1e-9, 1.0)), axes=(0, 0))
+                    ).astype(np.float32)
+                    log_oof = log_oof / np.clip(log_oof.sum(axis=1, keepdims=True), 1e-9, None)
+                    log_test = np.exp(
+                        np.tensordot(weights, np.log(np.clip(test_tensor[idx], 1e-9, 1.0)), axes=(0, 0))
+                    ).astype(np.float32)
+                    log_test = log_test / np.clip(log_test.sum(axis=1, keepdims=True), 1e-9, None)
+                    log_score = float(_score_predictions(y_valid, log_oof))
+                    if log_score > best_score:
+                        best_score = log_score
+                        best_weights = weights.copy()
+                        best_combo = tuple(int(i) for i in idx.tolist())
+                        best_oof = log_oof
+                        best_test = log_test
+                        random_meta["best_trial"] = int(global_trial_idx)
+                        random_meta["best_mode"] = "geometric"
+                        random_meta["best_strategy"] = str(spec["name"])
+
+                global_trial_idx += 1
+
+    if best_weights is None or best_combo is None or best_oof is None or best_test is None:
+        print("[FINAL_BLEND] Blend search failed to find a valid solution.")
+        return
+
+    power_refine = {"enabled": True, "applied": False, "best_power": 1.0, "base_valid_auc": float(best_score)}
+    for power in np.arange(0.70, 1.31, 0.05, dtype=np.float32):
+        p = float(power)
+        if abs(p - 1.0) < 1e-9:
+            continue
+        candidate_oof = _power_normalize_proba(best_oof, p)
+        candidate_score = float(_score_predictions(y_valid, candidate_oof))
+        if candidate_score > best_score + 1e-8:
+            best_score = candidate_score
+            best_oof = candidate_oof
+            best_test = _power_normalize_proba(best_test, p)
+            power_refine["applied"] = True
+            power_refine["best_power"] = float(p)
+
+    class_weight_calibration = {
+        "enabled": False,
+        "applied": False,
+        "base_valid_auc": float(best_score),
+    }
+    if n_classes > 2 and _resolve_class_weight_calibration_enabled(paths, default=True):
+        grid = _resolve_class_weight_calibration_grid(paths)
+        random_trials = _resolve_class_weight_calibration_trials(paths, default=120)
+        class_weight_calibration["enabled"] = True
+        cal_oof, cal_weights, cal_score, n_evaluated = _optimize_class_probability_weights(
+            y_true=y_valid,
+            pred=best_oof,
+            grid_values=grid,
+            random_trials=random_trials,
+            random_state=42,
+        )
+        class_weight_calibration["weights"] = [float(v) for v in cal_weights.tolist()]
+        class_weight_calibration["n_weight_candidates_evaluated"] = int(n_evaluated)
+        class_weight_calibration["calibrated_valid_auc"] = float(cal_score)
+        if cal_score > best_score + 1e-8:
+            best_oof = cal_oof
+            best_test = _apply_class_probability_weights(best_test, cal_weights)
+            best_score = float(cal_score)
+            class_weight_calibration["applied"] = True
+
+    decision_calibration = {
+        "enabled": bool(n_classes > 1),
+        "applied": False,
+        "base_valid_auc": float(best_score),
+    }
+    if n_classes > 1:
+        cal_oof, cal_bias, cal_temp, cal_score, n_eval = _optimize_logit_bias_temperature(
+            y_true=y_valid,
+            pred=best_oof,
+            random_trials=max(2000, _resolve_class_weight_calibration_trials(paths, default=120)),
+            random_state=73,
+        )
+        decision_calibration["bias"] = [float(v) for v in cal_bias.tolist()]
+        decision_calibration["temperature"] = float(cal_temp)
+        decision_calibration["n_candidates_evaluated"] = int(n_eval)
+        decision_calibration["calibrated_valid_auc"] = float(cal_score)
+        if cal_score > best_score + 1e-8:
+            best_oof = cal_oof
+            best_test = _apply_logit_bias_temperature(best_test, bias=cal_bias, temperature=cal_temp)
+            best_score = float(cal_score)
+            decision_calibration["applied"] = True
+
+    out_dir = paths.level2_results_dir / "final_blend"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    np.save(out_dir / "final_blend_valid_pred.npy", best_oof.astype(np.float32))
+    np.save(out_dir / "final_blend_test_pred.npy", best_test.astype(np.float32))
+    submission_path = _write_submission_from_proba(
+        paths=paths,
+        pred=best_test,
+        class_labels=class_labels,
+        target_col=target_col,
+        filename="submission_final_blend.csv",
+    )
+    best_single_submission = _write_submission_from_proba(
+        paths=paths,
+        pred=np.asarray(best_single["pred"]),
+        class_labels=class_labels,
+        target_col=target_col,
+        filename="submission_best_single_valid.csv",
+    )
+
+    blend_items: list[dict[str, object]] = []
+    for weight, idx in zip(best_weights, best_combo):
+        cand = random_pool[idx] if idx < len(random_pool) else pool[idx]
+        blend_items.append(
+            {
+                "name": str(cand["name"]),
+                "weight": float(weight),
+                "candidate_valid_auc": float(cand["individual_auc"]),
+            }
+        )
+
+    summary = {
+        "target_col": target_col,
+        "best_valid_auc": float(best_score),
+        "best_single_name": str(best_single["name"]),
+        "best_single_valid_auc": float(best_single["individual_auc"]),
+        "blend_candidates": [
+            {"name": str(c["name"]), "valid_auc": float(c["individual_auc"])}
+            for c in random_pool
+        ],
+        "selected_blend": blend_items,
+        "grid_step": float(step),
+        "coarse_grid_pool_size": int(len(coarse_pool)),
+        "random_pool_size": int(len(random_pool)),
+        "random_search": random_meta,
+        "power_refine": power_refine,
+        "class_weight_calibration": class_weight_calibration,
+        "decision_calibration": decision_calibration,
+        "submission_path": str(submission_path),
+        "best_single_submission_path": str(best_single_submission),
+    }
+    (out_dir / "final_blend_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    try:
+        _archive_final_blend_artifacts(
+            paths=paths,
+            valid_pred=best_oof,
+            test_pred=best_test,
+            summary=summary,
+            max_keep=24,
+        )
+    except Exception:
+        pass
+    print(f"[FINAL_BLEND] best_valid_auc={best_score:.6f}")
+    print(f"[FINAL_BLEND] Saved artifacts in: {out_dir}")
+    print(f"[FINAL_BLEND] Submission: {submission_path}")
 
 
 def _pseudo_labeling() -> None:
@@ -2815,6 +4681,15 @@ def _pseudo_labeling() -> None:
         try:
             m = json.loads(hc_metrics.read_text(encoding="utf-8"))
             ranked_sources.append((float(m.get("final_valid_auc", 0.0)), "hill_climb", hc_pred))
+        except Exception:
+            pass
+
+    final_pred = paths.level2_results_dir / "final_blend" / "final_blend_test_pred.npy"
+    final_summary = paths.level2_results_dir / "final_blend" / "final_blend_summary.json"
+    if final_pred.exists() and final_summary.exists():
+        try:
+            m = json.loads(final_summary.read_text(encoding="utf-8"))
+            ranked_sources.append((float(m.get("best_valid_auc", 0.0)), "final_blend", final_pred))
         except Exception:
             pass
 
@@ -3029,6 +4904,7 @@ def _kgmon_playbook() -> None:
     _eda()
     _hill_climb()
     _stacking()
+    _final_blend()
     _pseudo_labeling()
     _extra_training()
 
@@ -3043,6 +4919,7 @@ STAGES: dict[str, StageFn] = {
     "hill_climb": _hill_climb,
     "gpu_hill_climbing": _hill_climb,
     "stacking": _stacking,
+    "final_blend": _final_blend,
     "pseudo_labeling": _pseudo_labeling,
     "extra_training": _extra_training,
     "gpu_extra_training": _extra_training,
@@ -3088,6 +4965,7 @@ def run_stage_with_config(
         _eda()
         _hill_climb()
         _stacking()
+        _final_blend()
         _pseudo_labeling()
         _extra_training()
         return

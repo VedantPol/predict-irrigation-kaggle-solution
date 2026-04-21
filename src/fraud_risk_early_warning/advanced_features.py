@@ -480,6 +480,7 @@ def _add_multi_scale_numeric_bins(
     log_bins: list[int],
 ) -> tuple[dict[str, pd.DataFrame], list[str]]:
     out = {k: pd.DataFrame(index=v.index) for k, v in split_frames.items()}
+    per_split_features: dict[str, dict[str, pd.Series]] = {k: {} for k in split_frames}
     train_df = split_frames["train"]
 
     present_nums = _existing_columns(train_df, numeric_columns)
@@ -494,7 +495,7 @@ def _add_multi_scale_numeric_bins(
             for split in out:
                 s = _to_numeric(split_frames[split][col])
                 b = pd.cut(s, bins=edges, labels=False, include_lowest=True)
-                out[split][name] = b.fillna(-1).astype("int32")
+                per_split_features[split][name] = b.fillna(-1).astype("int32")
 
         for n_bins in fixed_bins:
             edges = _fit_fixed_bins(train_s, n_bins)
@@ -504,7 +505,7 @@ def _add_multi_scale_numeric_bins(
             for split in out:
                 s = _to_numeric(split_frames[split][col])
                 b = pd.cut(s, bins=edges, labels=False, include_lowest=True)
-                out[split][name] = b.fillna(-1).astype("int32")
+                per_split_features[split][name] = b.fillna(-1).astype("int32")
 
         for n_bins in log_bins:
             fit = _fit_log_bins(train_s, n_bins)
@@ -516,13 +517,16 @@ def _add_multi_scale_numeric_bins(
                 s = _to_numeric(split_frames[split][col])
                 log_s = np.log1p(s + shift)
                 b = pd.cut(log_s, bins=edges, labels=False, include_lowest=True)
-                out[split][name] = b.fillna(-1).astype("int32")
+                per_split_features[split][name] = b.fillna(-1).astype("int32")
 
         floor_name = f"bin__{col}__floor"
         for split in out:
             s = _to_numeric(split_frames[split][col]).fillna(0.0)
-            out[split][floor_name] = np.floor(s).astype("int32")
+            per_split_features[split][floor_name] = np.floor(s).astype("int32")
 
+    for split in out:
+        if per_split_features[split]:
+            out[split] = pd.DataFrame(per_split_features[split], index=split_frames[split].index)
     return out, list(out["train"].columns)
 
 
@@ -534,6 +538,7 @@ def _add_frequency_features(
     out = {k: pd.DataFrame(index=v.index) for k, v in split_frames.items()}
     if not columns:
         return out, []
+    per_split_features: dict[str, dict[str, pd.Series]] = {k: {} for k in split_frames}
 
     joined = pd.concat([
         pd.DataFrame({c: _as_category_key(split_frames[s][c]) for c in columns if c in split_frames[s].columns})
@@ -552,13 +557,18 @@ def _add_frequency_features(
             if col not in split_frames[split].columns:
                 continue
             key = _as_category_key(split_frames[split][col])
-            out[split][f"freq__{col}__freq"] = key.map(freq_map).astype(np.float32).fillna(0.0)
-            out[split][f"freq__{col}__count"] = key.map(count_map).astype(np.float32).fillna(0.0)
+            freq = key.map(freq_map).astype(np.float32).fillna(0.0)
+            count = key.map(count_map).astype(np.float32).fillna(0.0)
+            per_split_features[split][f"freq__{col}__freq"] = freq
+            per_split_features[split][f"freq__{col}__count"] = count
             if orig_count_map is not None:
-                synth_count = key.map(count_map).astype(np.float32).fillna(0.0)
                 orig_count = key.map(orig_count_map).astype(np.float32).fillna(0.0)
-                ratio = np.log1p((synth_count + 1.0) / (orig_count + 1.0))
-                out[split][f"freq__{col}__drift_ratio"] = ratio.astype(np.float32)
+                ratio = np.log1p((count + 1.0) / (orig_count + 1.0)).astype(np.float32)
+                per_split_features[split][f"freq__{col}__drift_ratio"] = ratio
+
+    for split in out:
+        if per_split_features[split]:
+            out[split] = pd.DataFrame(per_split_features[split], index=split_frames[split].index)
 
     return out, list(out["train"].columns)
 
